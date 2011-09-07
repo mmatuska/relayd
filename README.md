@@ -22,9 +22,9 @@ The relayctl program controls the relayd(8) daemon.
 ## Missing functionality
 
 The following relayd functionality is not (yet) implemented in FreeBSD:
-carp
-routers
-snmp
+ - carp
+ - routers
+ - snmp
 
 [1]: http://www.freebsd.org/
 [2]: http://www.openbsd.org/
