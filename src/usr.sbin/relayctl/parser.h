@@ -23,7 +23,9 @@ enum actions {
 	SHOW_RDRS,
 	SHOW_RELAYS,
 	SHOW_SESSIONS,
+#ifndef __FreeBSD__
 	SHOW_ROUTERS,
+#endif
 	RDR_DISABLE,
 	RDR_ENABLE,
 	TABLE_DISABLE,

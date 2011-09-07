@@ -80,7 +80,9 @@ hce_init(struct privsep *ps, struct privsep_proc *p, void *arg)
 	/* Allow maximum available sockets for TCP checks */
 	socket_rlimit(-1);
 
+#ifndef __FreeBSD__
 	snmp_init(env, PROC_PARENT);
+#endif
 }
 
 void
@@ -263,8 +265,10 @@ hce_notify_done(struct host *host, enum host_error he)
 		    print_availability(host->check_cnt, host->up_cnt));
 	}
 
+#ifndef __FreeBSD__
 	if (host->last_up != host->up)
 		snmp_hosttrap(env, table, host);
+#endif
 
 	host->last_up = host->up;
 
@@ -350,9 +354,11 @@ hce_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 	case IMSG_CFG_HOST:
 		config_gethost(env, imsg);
 		break;
+#ifndef __FreeBSD__
 	case IMSG_SNMPSOCK:
 		snmp_getsock(env, imsg);
 		break;
+#endif
 	case IMSG_CFG_DONE:
 		config_getcfg(env, imsg);
 		hce_setup_events();

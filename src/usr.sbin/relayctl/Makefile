@@ -1,18 +1,24 @@
-#	$OpenBSD: Makefile,v 1.4 2010/05/26 16:44:32 nicm Exp $
+# $FreeBSD$
 
-.PATH:		${.CURDIR}/../relayd
+PROG=	relayctl
 
-PROG=		relayctl
-SRCS=		log.c relayctl.c parser.c
+.PATH:	${.CURDIR}/../../lib/libutil
+SRCS=	imsg-buffer.c \
+	imsg.c
 
-MAN=		relayctl.8
+.PATH:	${.CURDIR}/../relayd
+SRCS+=	log.c
 
-LDADD=		-lutil
-DPADD=		${LIBUTIL}
-CFLAGS+=	-Wall -Werror -I${.CURDIR} -I${.CURDIR}/../relayd
-CFLAGS+=	-Wstrict-prototypes -Wmissing-prototypes
-CFLAGS+=	-Wmissing-declarations
-CFLAGS+=	-Wshadow -Wpointer-arith -Wcast-qual
-CFLAGS+=	-Wsign-compare -Wbounded
+.PATH:	${.CURDIR}
+SRCS+=	relayctl.c \
+	parser.c
+
+MAN=	relayctl.8
+
+CFLAGS+=	-D__dead=''
+CFLAGS+=	-I${.CURDIR} \
+		-I${.CURDIR}/../../lib/libutil \
+		-I${.CURDIR}/../relayd \
+		-I${PREFIX}/include
 
 .include <bsd.prog.mk>
