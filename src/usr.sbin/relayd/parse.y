@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.158 2011/05/26 14:48:20 reyk Exp $	*/
+/*	$OpenBSD: parse.y,v 1.161 2012/01/21 13:40:48 camield Exp $	*/
 
 /*
  * Copyright (c) 2007-2011 Reyk Floeter <reyk@openbsd.org>
@@ -378,24 +378,6 @@ main		: INTERVAL NUMBER	{
 			conf->sc_prefork_relay = $2;
 		}
 /* FreeBSD exclude
-		| DEMOTE STRING		{
-			if (loadcfg)
-				break;
-			conf->sc_flags |= F_DEMOTE;
-			if (strlcpy(conf->sc_demote_group, $2,
-			    sizeof(conf->sc_demote_group))
-			    >= sizeof(conf->sc_demote_group)) {
-				yyerror("yyparse: demote group name too long");
-				free($2);
-				YYERROR;
-			}
-			free($2);
-			if (carp_demote_init(conf->sc_demote_group, 1) == -1) {
-				yyerror("yyparse: error initializing group %s",
-				    conf->sc_demote_group);
-				YYERROR;
-			}
-		}
 		| SEND TRAP		{
 			if (loadcfg)
 				break;
@@ -849,13 +831,6 @@ proto		: relay_proto PROTO STRING	{
 			p->type = $1;
 			p->cache = RELAY_CACHESIZE;
 			p->tcpflags = TCPFLAG_DEFAULT;
-			if (p->type != RELAY_PROTO_TCP) {
-				/*
-				 * Splicing is currently only supported
-				 * for plain TCP relays.
-				 */
-				p->tcpflags |= TCPFLAG_NSPLICE;
-			}
 			p->sslflags = SSLFLAG_DEFAULT;
 			p->tcpbacklog = RELAY_BACKLOG;
 			(void)strlcpy(p->sslciphers, SSLCIPHERS_DEFAULT,
@@ -2316,9 +2291,6 @@ load_config(const char *filename, struct relayd *x_conf)
 		log_warnx("no actions, nothing to do");
 		errors++;
 	}
-
-	if (TAILQ_EMPTY(conf->sc_relays))
-		conf->sc_prefork_relay = 0;
 
 	/* Cleanup relay list to inherit */
 	while ((rlay = TAILQ_FIRST(&relays)) != NULL) {

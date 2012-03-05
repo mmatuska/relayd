@@ -1,4 +1,4 @@
-/*	$OpenBSD: hce.c,v 1.60 2011/05/19 08:56:49 reyk Exp $	*/
+/*	$OpenBSD: hce.c,v 1.62 2012/01/21 13:40:48 camield Exp $	*/
 
 /*
  * Copyright (c) 2006 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -307,7 +307,7 @@ hce_dispatch_pfe(int fd, struct privsep_proc *p, struct imsg *imsg)
 	case IMSG_HOST_DISABLE:
 		memcpy(&id, imsg->data, sizeof(id));
 		if ((host = host_find(env, id)) == NULL)
-			fatalx("hce_dispatch_imsg: desynchronized");
+			fatalx("hce_dispatch_pfe: desynchronized");
 		host->flags |= F_DISABLE;
 		host->up = HOST_UNKNOWN;
 		host->check_cnt = 0;
@@ -317,7 +317,7 @@ hce_dispatch_pfe(int fd, struct privsep_proc *p, struct imsg *imsg)
 	case IMSG_HOST_ENABLE:
 		memcpy(&id, imsg->data, sizeof(id));
 		if ((host = host_find(env, id)) == NULL)
-			fatalx("hce_dispatch_imsg: desynchronized");
+			fatalx("hce_dispatch_pfe: desynchronized");
 		host->flags &= ~(F_DISABLE);
 		host->up = HOST_UNKNOWN;
 		host->he = HCE_NONE;
@@ -325,7 +325,7 @@ hce_dispatch_pfe(int fd, struct privsep_proc *p, struct imsg *imsg)
 	case IMSG_TABLE_DISABLE:
 		memcpy(&id, imsg->data, sizeof(id));
 		if ((table = table_find(env, id)) == NULL)
-			fatalx("hce_dispatch_imsg: desynchronized");
+			fatalx("hce_dispatch_pfe: desynchronized");
 		table->conf.flags |= F_DISABLE;
 		TAILQ_FOREACH(host, &table->hosts, entry)
 			host->up = HOST_UNKNOWN;
@@ -333,7 +333,7 @@ hce_dispatch_pfe(int fd, struct privsep_proc *p, struct imsg *imsg)
 	case IMSG_TABLE_ENABLE:
 		memcpy(&id, imsg->data, sizeof(id));
 		if ((table = table_find(env, id)) == NULL)
-			fatalx("hce_dispatch_imsg: desynchronized");
+			fatalx("hce_dispatch_pfe: desynchronized");
 		table->conf.flags &= ~(F_DISABLE);
 		TAILQ_FOREACH(host, &table->hosts, entry)
 			host->up = HOST_UNKNOWN;
@@ -375,6 +375,8 @@ hce_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 #endif
 	case IMSG_CFG_DONE:
 		config_getcfg(env, imsg);
+		break;
+	case IMSG_CTL_START:
 		hce_setup_events();
 		break;
 	case IMSG_CTL_RESET:
