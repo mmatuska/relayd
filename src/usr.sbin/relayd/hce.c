@@ -1,4 +1,4 @@
-/*	$OpenBSD: hce.c,v 1.62 2012/01/21 13:40:48 camield Exp $	*/
+/*	$OpenBSD: hce.c,v 1.63 2012/05/09 12:54:13 giovanni Exp $	*/
 
 /*
  * Copyright (c) 2006 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -209,17 +209,17 @@ hce_notify_done(struct host *host, enum host_error he)
 	struct timeval		 tv_now, tv_dur;
 	u_long			 duration;
 	u_int			 logopt;
-	struct host		*h, *hostupd;
+	struct host		*h, *hostnst;
 	int			 hostup;
 	const char		*msg;
 
-	if ((hostupd = host_find(env, host->conf.id)) == NULL)
+	if ((hostnst = host_find(env, host->conf.id)) == NULL)
 		fatalx("hce_notify_done: desynchronized");
 
 	if ((table = table_find(env, host->conf.tableid)) == NULL)
 		fatalx("hce_notify_done: invalid table id");
 
-	if (hostupd->flags & F_DISABLE) {
+	if (hostnst->flags & F_DISABLE) {
 		if (env->sc_opts & RELAYD_OPT_LOGUPDATE) {
 			log_info("host %s, check %s%s (ignoring result, "
 			    "host disabled)",

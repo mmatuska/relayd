@@ -1,4 +1,4 @@
-/*	$OpenBSD: pfe_filter.c,v 1.47 2011/05/19 08:56:49 reyk Exp $	*/
+/*	$OpenBSD: pfe_filter.c,v 1.48 2012/03/09 13:50:07 benno Exp $	*/
 
 /*
  * Copyright (c) 2006 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -535,6 +535,8 @@ sync_ruleset(struct relayd *env, struct rdr *rdr, int enable)
 		rio.rule.dst.port[1] = address->port.val[1];
 #ifndef __FreeBSD__
 		rio.rule.rtableid = -1; /* stay in the main routing table */
+		rio.rule.onrdomain = getrtable();
+		rio.rule.prio[0] = rio.rule.prio[1] = PF_PRIO_NOTSET;
 #endif
 
 		if (rio.rule.proto == IPPROTO_TCP)
