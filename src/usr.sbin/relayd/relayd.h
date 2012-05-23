@@ -29,7 +29,7 @@
 #include <imsg.h>
 
 #ifdef __FreeBSD__
-#define	CONF_FILE		"%%PREFIX%%/etc/relayd.conf"
+#define	CONF_FILE		"/usr/local/etc/relayd.conf"
 #else
 #define CONF_FILE		"/etc/relayd.conf"
 #endif
