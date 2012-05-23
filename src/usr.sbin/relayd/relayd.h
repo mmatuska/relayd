@@ -1,4 +1,4 @@
-/*	$OpenBSD: relayd.h,v 1.152 2012/01/21 13:40:48 camield Exp $	*/
+/*	$OpenBSD: relayd.h,v 1.154 2012/05/08 15:10:15 benno Exp $	*/
 
 /*
  * Copyright (c) 2006, 2007 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -478,6 +478,7 @@ struct protonode_config {
 	size_t				 keylen;
 	size_t				 valuelen;
 	size_t				 len;
+	size_t                           labelnamelen;
 	u_int				 dir;
 };
 
@@ -490,6 +491,7 @@ struct protonode {
 	u_int16_t			 mark;
 	u_int16_t			 label;
 
+	char                            *labelname;
 	char				*key;
 	char				*value;
 
@@ -607,6 +609,7 @@ struct relay {
 	int			 rl_dstnhosts;
 
 	struct event		 rl_ev;
+	struct event		 rl_evt;
 
 	SSL_CTX			*rl_ssl_ctx;
 	char			*rl_ssl_cert;
@@ -677,6 +680,7 @@ struct ctl_netroute {
 struct control_sock {
 	const char	*cs_name;
 	struct event	 cs_ev;
+	struct event	 cs_evt;
 	int		 cs_fd;
 	int		 cs_restricted;
 	void		*cs_env;

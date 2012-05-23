@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.161 2012/01/21 13:40:48 camield Exp $	*/
+/*	$OpenBSD: parse.y,v 1.163 2012/05/08 15:10:15 benno Exp $	*/
 
 /*
  * Copyright (c) 2007-2011 Reyk Floeter <reyk@openbsd.org>
@@ -867,6 +867,7 @@ protoptsl	: SSL sslflags
 		}
 		| direction			{
 			node.label = label;
+			node.labelname = NULL;
 			nodedirection = $1;
 		} protonode {
 			if (nodedirection != -1 &&
@@ -2691,6 +2692,7 @@ table_inherit(struct table *tb)
 		h->conf.id = ++last_host_id;
 		if (last_host_id == INT_MAX) {
 			yyerror("too many hosts defined");
+			free(h);
 			goto fail;
 		}
 		h->conf.tableid = tb->conf.id;

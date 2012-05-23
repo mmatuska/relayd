@@ -1,4 +1,4 @@
-/*	$OpenBSD: relayd.c,v 1.106 2012/01/21 13:40:48 camield Exp $	*/
+/*	$OpenBSD: relayd.c,v 1.108 2012/05/08 15:10:15 benno Exp $	*/
 
 /*
  * Copyright (c) 2007, 2008 Reyk Floeter <reyk@openbsd.org>
@@ -523,6 +523,8 @@ purge_tree(struct proto_tree *tree)
 				free(pn->key);
 			if (pn->value != NULL)
 				free(pn->value);
+			if (pn->labelname != NULL)
+				free(pn->labelname);
 			if (pn->label != 0)
 				pn_unref(pn->label);
 			free(pn);
@@ -813,6 +815,7 @@ expand_string(char *label, size_t len, const char *srch, const char *repl)
 		if ((strlcat(tmp, p, len) >= len) ||
 		    (strlcat(tmp, repl, len) >= len)) {
 			log_debug("%s: string too long", __func__);
+			free(tmp);
 			return (-1);
 		}
 		q += strlen(srch);
@@ -820,6 +823,7 @@ expand_string(char *label, size_t len, const char *srch, const char *repl)
 	}
 	if (strlcat(tmp, p, len) >= len) {
 		log_debug("%s: string too long", __func__);
+		free(tmp);
 		return (-1);
 	}
 	(void)strlcpy(label, tmp, len);	/* always fits */
@@ -987,6 +991,9 @@ protonode_add(enum direction dir, struct protocol *proto,
 	bcopy(node, pn, sizeof(*pn));
 	pn->key = node->key;
 	pn->value = node->value;
+	pn->labelname = NULL;
+	if (node->labelname != NULL)
+		pn->label = pn_name2id(node->labelname);
 	SIMPLEQ_INIT(&pn->head);
 	if (dir == RELAY_DIR_RESPONSE)
 		pn->id = proto->response_nodes++;
