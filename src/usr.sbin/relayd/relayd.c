@@ -1,4 +1,4 @@
-/*	$OpenBSD: relayd.c,v 1.108 2012/05/08 15:10:15 benno Exp $	*/
+/*	$OpenBSD: relayd.c,v 1.111 2012/10/03 08:46:05 reyk Exp $	*/
 
 /*
  * Copyright (c) 2007, 2008 Reyk Floeter <reyk@openbsd.org>
@@ -80,7 +80,11 @@ void
 parent_sig_handler(int sig, short event, void *arg)
 {
 	struct privsep	*ps = arg;
+#ifndef __FreeBSD__ /* unused variable fail */
 	int		 die = 0, status, fail, id;
+#else
+	int		 die = 0, status, id;
+#endif
 	pid_t		 pid;
 	char		*cause;
 
@@ -95,14 +99,20 @@ parent_sig_handler(int sig, short event, void *arg)
 			if (pid <= 0)
 				continue;
 
+#ifndef __FreeBSD__ /* unused variable fail */
 			fail = 0;
+#endif
 			if (WIFSIGNALED(status)) {
+#ifndef __FreeBSD__ /* unused variable fail */
 				fail = 1;
+#endif
 				asprintf(&cause, "terminated; signal %d",
 				    WTERMSIG(status));
 			} else if (WIFEXITED(status)) {
 				if (WEXITSTATUS(status) != 0) {
+#ifndef __FreeBSD__ /* unused variable fail */
 					fail = 1;
+#endif
 					asprintf(&cause, "exited abnormally");
 				} else
 					asprintf(&cause, "exited okay");
@@ -602,6 +612,7 @@ void
 purge_relay(struct relayd *env, struct relay *rlay)
 {
 	struct rsession		*con;
+	struct relay_table	*rlt;
 
 	/* shutdown and remove relay */
 	if (event_initialized(&rlay->rl_ev))
@@ -628,6 +639,11 @@ purge_relay(struct relayd *env, struct relay *rlay)
 		free(rlay->rl_ssl_key);
 	if (rlay->rl_ssl_ca != NULL)
 		free(rlay->rl_ssl_ca);
+
+	while ((rlt = TAILQ_FIRST(&rlay->rl_tables))) {
+		TAILQ_REMOVE(&rlay->rl_tables, rlt, rlt_entry);
+		free(rlt);
+	}
 
 	free(rlay);
 }
@@ -1272,3 +1288,24 @@ get_data(u_int8_t *ptr, size_t len)
 
 	return (data);
 }
+
+#ifndef __FreeBSD__ /* file descriptor accounting */
+int
+accept_reserve(int sockfd, struct sockaddr *addr, socklen_t *addrlen,
+    int reserve, volatile int *counter)
+{
+	int ret;
+	if (getdtablecount() + reserve +
+	    *counter >= getdtablesize()) {
+		errno = EMFILE;
+		return -1;
+	}
+
+	if ((ret = accept(sockfd, addr, addrlen)) > -1) {
+		(*counter)++;
+		DPRINTF("%s: inflight incremented, now %d",__func__,
+		    *counter);
+	}
+	return ret;
+}
+#endif

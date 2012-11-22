@@ -20,6 +20,7 @@ SRCS+=	parse.y \
 	pfe_filter.c \
 	hce.c \
 	relay.c \
+	relay_http.c \
 	relay_udp.c \
 	check_icmp.c \
 	check_tcp.c \
