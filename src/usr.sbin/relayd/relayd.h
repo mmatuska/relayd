@@ -1,8 +1,8 @@
-/*	$OpenBSD: relayd.h,v 1.154 2012/05/08 15:10:15 benno Exp $	*/
+/*	$OpenBSD: relayd.h,v 1.162 2012/10/19 16:49:50 reyk Exp $	*/
 
 /*
+ * Copyright (c) 2006 - 2012 Reyk Floeter <reyk@openbsd.org>
  * Copyright (c) 2006, 2007 Pierre-Yves Ritschard <pyr@openbsd.org>
- * Copyright (c) 2006, 2007, 2008 Reyk Floeter <reyk@openbsd.org>
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
@@ -18,11 +18,18 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#ifndef _RELAYD_H
+#define _RELAYD_H
+
 #include <sys/tree.h>
 
 #include <sys/param.h>		/* MAXHOSTNAMELEN */
 #include <limits.h>
 #include <imsg.h>
+
+#ifndef nitems
+#define	nitems(_a)	(sizeof((_a)) / sizeof((_a)[0]))
+#endif
 
 #define CONF_FILE		"/etc/relayd.conf"
 #define RELAYD_SOCKET		"/var/run/relayd.sock"
@@ -41,6 +48,8 @@
 #define MAX_NAME_SIZE		64
 #define SRV_MAX_VIRTS		16
 
+#define FD_RESERVE		5
+
 #define RELAY_MAX_SESSIONS	1024
 #define RELAY_TIMEOUT		600
 #define RELAY_CACHESIZE		-1	/* use default size */
@@ -50,6 +59,7 @@
 #define RELAY_STATINTERVAL	60
 #define RELAY_BACKLOG		10
 #define RELAY_MAXLOOKUPLEVELS	5
+#define RELAY_OUTOF_FD_RETRIES	5
 
 #define CONFIG_RELOAD		0x00
 #define CONFIG_TABLES		0x01
@@ -96,6 +106,13 @@ struct ctl_status {
 struct ctl_id {
 	objid_t		 id;
 	char		 name[MAX_NAME_SIZE];
+};
+
+struct ctl_relaytable {
+	objid_t		 id;
+	objid_t		 relayid;
+	int		 mode;
+	u_int32_t	 flags;
 };
 
 struct ctl_script {
@@ -169,7 +186,7 @@ struct ctl_relay_event {
 
 	off_t			 splicelen;
 	int			 line;
-	size_t			 toread;
+	off_t			 toread;
 	int			 chunked;
 	int			 done;
 	enum httpmethod		 method;
@@ -397,6 +414,7 @@ struct rdr_config {
 	in_port_t		 port;
 	objid_t			 table_id;
 	objid_t			 backup_id;
+	int			 mode;
 	char			 name[SRV_NAME_SIZE];
 	char			 tag[TAG_NAME_SIZE];
 	struct timeval		 timeout;
@@ -420,12 +438,16 @@ struct rsession {
 	struct ctl_relay_event		 se_out;
 	void				*se_priv;
 	u_int32_t			 se_hashkey;
+	int				 se_hashkeyset;
+	struct relay_table		*se_table;
 	struct event			 se_ev;
 	struct timeval			 se_timeout;
 	struct timeval			 se_tv_start;
 	struct timeval			 se_tv_last;
+	struct event			 se_inflightevt;
 	int				 se_done;
 	int				 se_retry;
+	int				 se_retrycount;
 	u_int16_t			 se_mark;
 	struct evbuffer			*se_log;
 	struct relay			*se_relay;
@@ -568,6 +590,17 @@ struct protocol {
 };
 TAILQ_HEAD(protolist, protocol);
 
+struct relay_table {
+	struct table		*rlt_table;
+	u_int32_t		 rlt_flags;
+	int			 rlt_mode;
+	u_int32_t		 rlt_key;
+	struct host		*rlt_host[RELAY_MAXHOSTS];
+	int			 rlt_nhosts;
+	TAILQ_ENTRY(relay_table) rlt_entry;
+};
+TAILQ_HEAD(relaytables, relay_table);
+
 struct relay_config {
 	objid_t			 id;
 	u_int32_t		 flags;
@@ -576,10 +609,7 @@ struct relay_config {
 	char			 ifname[IFNAMSIZ];
 	in_port_t		 port;
 	in_port_t		 dstport;
-	int			 dstmode;
 	int			 dstretry;
-	objid_t			 dsttable;
-	objid_t			 backuptable;
 	struct sockaddr_storage	 ss;
 	struct sockaddr_storage	 dstss;
 	struct sockaddr_storage	 dstaf;
@@ -602,11 +632,7 @@ struct relay {
 	int			 rl_dsts;
 	struct bufferevent	*rl_dstbev;
 
-	struct table		*rl_dsttable;
-	struct table		*rl_backuptable;
-	u_int32_t		 rl_dstkey;
-	struct host		*rl_dsthost[RELAY_MAXHOSTS];
-	int			 rl_dstnhosts;
+	struct relaytables	 rl_tables;
 
 	struct event		 rl_ev;
 	struct event		 rl_evt;
@@ -623,9 +649,12 @@ struct relay {
 TAILQ_HEAD(relaylist, relay);
 
 enum dstmode {
-	RELAY_DSTMODE_LOADBALANCE	= 0,
-	RELAY_DSTMODE_ROUNDROBIN	= 1,
-	RELAY_DSTMODE_HASH		= 2
+	RELAY_DSTMODE_LOADBALANCE = 0,
+	RELAY_DSTMODE_ROUNDROBIN,
+	RELAY_DSTMODE_HASH,
+	RELAY_DSTMODE_SRCHASH,
+	RELAY_DSTMODE_LEASTSTATES,
+	RELAY_DSTMODE_RANDOM
 };
 #define RELAY_DSTMODE_DEFAULT		RELAY_DSTMODE_ROUNDROBIN
 
@@ -777,6 +806,7 @@ enum imsg_type {
 	IMSG_CFG_PROTO,
 	IMSG_CFG_PROTONODE,
 	IMSG_CFG_RELAY,
+	IMSG_CFG_RELAY_TABLE,
 	IMSG_CFG_DONE
 };
 
@@ -955,10 +985,33 @@ int	 relay_socket_af(struct sockaddr_storage *, in_port_t);
 in_port_t
 	 relay_socket_getport(struct sockaddr_storage *);
 int	 relay_cmp_af(struct sockaddr_storage *,
-		 struct sockaddr_storage *);
+	    struct sockaddr_storage *);
+void	 relay_write(struct bufferevent *, void *);
+void	 relay_read(struct bufferevent *, void *);
+void	 relay_error(struct bufferevent *, short, void *);
+int	 relay_lognode(struct rsession *,
+	    struct protonode *, struct protonode *, char *, size_t);
+int	 relay_connect(struct rsession *);
+void	 relay_connected(int, short, void *);
+void	 relay_bindanyreq(struct rsession *, in_port_t, int);
+void	 relay_bindany(int, short, void *);
+void	 relay_dump(struct ctl_relay_event *, const void *, size_t);
+int	 relay_bufferevent_add(struct event *, int);
+int	 relay_bufferevent_print(struct ctl_relay_event *, char *);
+int	 relay_bufferevent_write_buffer(struct ctl_relay_event *,
+	    struct evbuffer *);
+int	 relay_bufferevent_write_chunk(struct ctl_relay_event *,
+	    struct evbuffer *, size_t);
+int	 relay_bufferevent_write(struct ctl_relay_event *,
+	    void *, size_t);
 
 RB_PROTOTYPE(proto_tree, protonode, se_nodes, relay_proto_cmp);
 SPLAY_PROTOTYPE(session_tree, rsession, se_nodes, relay_session_cmp);
+
+/* relay_http.c */
+void	 relay_abort_http(struct rsession *, u_int, const char *,
+	    u_int16_t);
+void	 relay_read_http(struct bufferevent *, void *);
 
 /* relay_udp.c */
 void	 relay_udp_privinit(struct relayd *, struct relay *);
@@ -1030,6 +1083,8 @@ int		 imsg_compose_event(struct imsgev *, u_int16_t, u_int32_t,
 void		 socket_rlimit(int);
 char		*get_string(u_int8_t *, size_t);
 void		*get_data(u_int8_t *, size_t);
+int		 accept_reserve(int sockfd, struct sockaddr *addr,
+		    socklen_t *addrlen, int reserve, volatile int *);
 
 /* carp.c */
 int	 carp_demote_init(char *, int);
@@ -1111,3 +1166,6 @@ int	 config_setprotonode(struct relayd *, enum privsep_procid,
 int	 config_getprotonode(struct relayd *, struct imsg *);
 int	 config_setrelay(struct relayd *env, struct relay *);
 int	 config_getrelay(struct relayd *, struct imsg *);
+int	 config_getrelaytable(struct relayd *, struct imsg *);
+
+#endif /* _RELAYD_H */

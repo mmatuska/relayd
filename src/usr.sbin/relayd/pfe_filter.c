@@ -1,4 +1,4 @@
-/*	$OpenBSD: pfe_filter.c,v 1.48 2012/03/09 13:50:07 benno Exp $	*/
+/*	$OpenBSD: pfe_filter.c,v 1.52 2012/10/19 16:49:50 reyk Exp $	*/
 
 /*
  * Copyright (c) 2006 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -440,7 +440,6 @@ sync_ruleset(struct relayd *env, struct rdr *rdr, int enable)
 		rio.rule.dst.port[1] = address->port.val[1];
 		rio.rule.rtableid = -1; /* stay in the main routing table */
 		rio.rule.onrdomain = getrtable();
-		rio.rule.prio[0] = rio.rule.prio[1] = PF_PRIO_NOTSET;
 
 		if (rio.rule.proto == IPPROTO_TCP)
 			rio.rule.timeout[PFTM_TCP_ESTABLISHED] =
@@ -484,13 +483,24 @@ sync_ruleset(struct relayd *env, struct rdr *rdr, int enable)
 			    ntohs(rdr->table->conf.port);
 			rio.rule.rdr.port_op = PF_OP_EQ;
 		}
-		rio.rule.rdr.opts = PF_POOL_ROUNDROBIN;
+
+		switch (rdr->conf.mode) {
+		case RELAY_DSTMODE_ROUNDROBIN:
+			rio.rule.rdr.opts = PF_POOL_ROUNDROBIN;
+			break;
+		case RELAY_DSTMODE_LEASTSTATES:
+			rio.rule.rdr.opts = PF_POOL_LEASTSTATES;
+			break;
+		default:
+			fatalx("sync_ruleset: unsupported mode");
+			/* NOTREACHED */
+		}
 		if (rdr->conf.flags & F_STICKY)
 			rio.rule.rdr.opts |= PF_POOL_STICKYADDR;
 
 		if (rio.rule.rt == PF_ROUTETO) {
 			memcpy(&rio.rule.route, &rio.rule.rdr,
-			   sizeof(rio.rule.route));
+			    sizeof(rio.rule.route));
 			rio.rule.rdr.addr.type = PF_ADDR_NONE;
 		}
 

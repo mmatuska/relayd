@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.163 2012/05/08 15:10:15 benno Exp $	*/
+/*	$OpenBSD: parse.y,v 1.168 2012/10/19 16:49:50 reyk Exp $	*/
 
 /*
  * Copyright (c) 2007-2011 Reyk Floeter <reyk@openbsd.org>
@@ -30,6 +30,7 @@
 #include <sys/stat.h>
 #include <sys/queue.h>
 #include <sys/ioctl.h>
+#include <sys/hash.h>
 
 #include <net/if.h>
 #include <net/pfvar.h>
@@ -108,6 +109,7 @@ static struct router	*router = NULL;
 static u_int16_t	 label = 0;
 static in_port_t	 tableport = 0;
 static int		 nodedirection;
+static int		 dstmode;
 
 struct address	*host_v4(const char *);
 struct address	*host_v6(const char *);
@@ -156,6 +158,7 @@ typedef struct {
 %token	RETURN ROUNDROBIN ROUTE SACK SCRIPT SEND SESSION SOCKET SPLICE
 %token	SSL STICKYADDR STYLE TABLE TAG TCP TIMEOUT TO ROUTER RTLABEL
 %token	TRANSPARENT TRAP UPDATES URL VIRTUAL WITH TTL RTABLE MATCH
+%token	RANDOM LEASTSTATES SRCHASH
 %token	<v.string>	STRING
 %token  <v.number>	NUMBER
 %type	<v.string>	hostname interface table
@@ -483,9 +486,15 @@ rdroptsl	: forwardmode TO tablespec interface	{
 			if (rdr->table) {
 				rdr->backup = $3;
 				rdr->conf.backup_id = $3->conf.id;
+				if (dstmode != rdr->conf.mode) {
+					yyerror("backup table for %s with "
+					    "different mode", rdr->conf.name);
+					YYERROR;
+				}
 			} else {
 				rdr->table = $3;
 				rdr->conf.table_id = $3->conf.id;
+				rdr->conf.mode = dstmode;
 			}
 			$3->conf.fwdmode = $1;
 			$3->conf.rdrid = rdr->conf.id;
@@ -576,7 +585,8 @@ tabledef	: TABLE table		{
 			    sizeof(struct timeval));
 			TAILQ_INIT(&tb->hosts);
 			table = tb;
-		} tabledefopts_l 	{
+			dstmode = RELAY_DSTMODE_DEFAULT;
+		} tabledefopts_l	{
 			if (TAILQ_EMPTY(&table->hosts)) {
 				yyerror("table %s has no hosts",
 				    table->conf.name);
@@ -607,7 +617,7 @@ tablelist	: host			{
 		| include
 		;
 
-tablespec	: table 		{
+tablespec	: table			{
 			struct table	*tb;
 			if ((tb = calloc(1, sizeof (*tb))) == NULL)
 				fatal("out of memory");
@@ -666,12 +676,15 @@ tableopts	: CHECK tablecheck
 				    "divisible by global interval");
 				YYERROR;
 			}
-			table->conf.skip_cnt = ($2 / conf->sc_interval.tv_sec) - 1;
+			table->conf.skip_cnt =
+			    ($2 / conf->sc_interval.tv_sec) - 1;
 		}
 		| MODE dstmode		{
 			switch ($2) {
 			case RELAY_DSTMODE_LOADBALANCE:
 			case RELAY_DSTMODE_HASH:
+			case RELAY_DSTMODE_SRCHASH:
+			case RELAY_DSTMODE_RANDOM:
 				if (rdr != NULL) {
 					yyerror("mode not supported "
 					    "for redirections");
@@ -679,8 +692,15 @@ tableopts	: CHECK tablecheck
 				}
 				/* FALLTHROUGH */
 			case RELAY_DSTMODE_ROUNDROBIN:
-				if (rlay != NULL)
-					rlay->rl_conf.dstmode = $2;
+				dstmode = $2;
+				break;
+			case RELAY_DSTMODE_LEASTSTATES:
+				if (rdr == NULL) {
+					yyerror("mode not supported "
+					    "for relays");
+					YYERROR;
+				}
+				dstmode = $2;
 				break;
 			}
 		}
@@ -1212,7 +1232,8 @@ relay		: RELAY STRING	{
 			if ((r = calloc(1, sizeof (*r))) == NULL)
 				fatal("out of memory");
 
-			if (strlcpy(r->rl_conf.name, $2, sizeof(r->rl_conf.name)) >=
+			if (strlcpy(r->rl_conf.name, $2,
+			    sizeof(r->rl_conf.name)) >=
 			    sizeof(r->rl_conf.name)) {
 				yyerror("relay name truncated");
 				free(r);
@@ -1223,14 +1244,14 @@ relay		: RELAY STRING	{
 			r->rl_conf.timeout.tv_sec = RELAY_TIMEOUT;
 			r->rl_proto = NULL;
 			r->rl_conf.proto = EMPTY_ID;
-			r->rl_conf.dsttable = EMPTY_ID;
-			r->rl_conf.dstmode = RELAY_DSTMODE_DEFAULT;
 			r->rl_conf.dstretry = 0;
+			TAILQ_INIT(&r->rl_tables);
 			if (last_relay_id == INT_MAX) {
 				yyerror("too many relays defined");
 				free(r);
 				YYERROR;
 			}
+			dstmode = RELAY_DSTMODE_DEFAULT;
 			rlay = r;
 		} '{' optnl relayopts_l '}'	{
 			struct relay	*r;
@@ -1248,15 +1269,10 @@ relay		: RELAY STRING	{
 			}
 			if ((rlay->rl_conf.flags & (F_NATLOOK|F_DIVERT)) == 0 &&
 			    rlay->rl_conf.dstss.ss_family == AF_UNSPEC &&
-			    rlay->rl_conf.dsttable == EMPTY_ID) {
+			    TAILQ_EMPTY(&rlay->rl_tables)) {
 				yyerror("relay %s has no target, rdr, "
 				    "or table", rlay->rl_conf.name);
 				YYERROR;
-			}
-			if (rlay->rl_backuptable == NULL) {
-				rlay->rl_conf.backuptable =
-				    conf->sc_empty_table.conf.id;
-				rlay->rl_backuptable = &conf->sc_empty_table;
 			}
 			if (rlay->rl_conf.proto == EMPTY_ID) {
 				rlay->rl_proto = &conf->sc_proto_default;
@@ -1379,8 +1395,8 @@ forwardspec	: STRING port retry	{
 			struct address		*h;
 
 			if (rlay->rl_conf.dstss.ss_family != AF_UNSPEC) {
-				yyerror("relay %s target or redirection already "
-				    "specified", rlay->rl_conf.name);
+				yyerror("relay %s target or redirection "
+				    "already specified", rlay->rl_conf.name);
 				free($1);
 				YYERROR;
 			}
@@ -1415,20 +1431,21 @@ forwardspec	: STRING port retry	{
 			rlay->rl_conf.dstretry = $2;
 		}
 		| tablespec	{
-			if (rlay->rl_backuptable) {
-				yyerror("only one backup table is allowed");
+			struct relay_table	*rlt;
+
+			if ((rlt = calloc(1, sizeof(*rlt))) == NULL) {
+				yyerror("failed to allocate table reference");
 				YYERROR;
 			}
-			if (rlay->rl_dsttable) {
-				rlay->rl_backuptable = $1;
-				rlay->rl_backuptable->conf.flags |= F_USED;
-				rlay->rl_conf.backuptable = $1->conf.id;
-			} else {
-				rlay->rl_dsttable = $1;
-				rlay->rl_dsttable->conf.flags |= F_USED;
-				rlay->rl_conf.dsttable = $1->conf.id;
-				rlay->rl_conf.dstport = $1->conf.port;
-			}
+
+			rlt->rlt_table = $1;
+			rlt->rlt_table->conf.flags |= F_USED;
+			rlt->rlt_mode = dstmode;
+			rlt->rlt_flags = F_USED;
+			if (!TAILQ_EMPTY(&rlay->rl_tables))
+				rlt->rlt_flags |= F_BACKUP;
+
+			TAILQ_INSERT_TAIL(&rlay->rl_tables, rlt, rlt_entry);
 		}
 		;
 
@@ -1436,6 +1453,9 @@ dstmode		: /* empty */		{ $$ = RELAY_DSTMODE_DEFAULT; }
 		| LOADBALANCE		{ $$ = RELAY_DSTMODE_LOADBALANCE; }
 		| ROUNDROBIN		{ $$ = RELAY_DSTMODE_ROUNDROBIN; }
 		| HASH			{ $$ = RELAY_DSTMODE_HASH; }
+		| LEASTSTATES		{ $$ = RELAY_DSTMODE_LEASTSTATES; }
+		| SRCHASH		{ $$ = RELAY_DSTMODE_SRCHASH; }
+		| RANDOM		{ $$ = RELAY_DSTMODE_RANDOM; }
 		;
 
 router		: ROUTER STRING		{
@@ -1795,6 +1815,7 @@ lookup(char *s)
 		{ "interval",		INTERVAL },
 		{ "ip",			IP },
 		{ "label",		LABEL },
+		{ "least-states",	LEASTSTATES },
 		{ "listen",		LISTEN },
 		{ "loadbalance",	LOADBALANCE },
 		{ "log",		LOG },
@@ -1815,6 +1836,7 @@ lookup(char *s)
 		{ "priority",		PRIORITY },
 		{ "protocol",		PROTO },
 		{ "query",		QUERYSTR },
+		{ "random",		RANDOM },
 		{ "real",		REAL },
 		{ "redirect",		REDIRECT },
 		{ "relay",		RELAY },
@@ -1833,6 +1855,7 @@ lookup(char *s)
 		{ "send",		SEND },
 		{ "session",		SESSION },
 		{ "socket",		SOCKET },
+		{ "source-hash",	SRCHASH },
 		{ "splice",		SPLICE },
 		{ "ssl",		SSL },
 		{ "sticky-address",	STICKYADDR },
@@ -2211,9 +2234,10 @@ parse_config(const char *filename, struct relayd *x_conf)
 int
 load_config(const char *filename, struct relayd *x_conf)
 {
-	struct sym	*sym, *next;
-	struct table	*nexttb;
-	struct host	*h, *ph;
+	struct sym		*sym, *next;
+	struct table		*nexttb;
+	struct host		*h, *ph;
+	struct relay_table	*rlt;
 
 	conf = x_conf;
 	conf->sc_flags = 0;
@@ -2266,6 +2290,10 @@ load_config(const char *filename, struct relayd *x_conf)
 	/* Cleanup relay list to inherit */
 	while ((rlay = TAILQ_FIRST(&relays)) != NULL) {
 		TAILQ_REMOVE(&relays, rlay, rl_entry);
+		while ((rlt = TAILQ_FIRST(&rlay->rl_tables))) {
+			TAILQ_REMOVE(&rlay->rl_tables, rlt, rlt_entry);
+			free(rlt);
+		}
 		free(rlay);
 	}
 
@@ -2680,7 +2708,9 @@ table_inherit(struct table *tb)
 	tb->conf.flags |= dsttb->conf.flags;
 
 	/* Inherit global table options */
-	bcopy(&dsttb->conf.timeout, &tb->conf.timeout, sizeof(struct timeval));
+	if (tb->conf.timeout.tv_sec == 0 && tb->conf.timeout.tv_usec == 0)
+		bcopy(&dsttb->conf.timeout, &tb->conf.timeout,
+		    sizeof(struct timeval));
 
 	/* Copy the associated hosts */
 	TAILQ_INIT(&tb->hosts);
@@ -2715,6 +2745,7 @@ struct relay *
 relay_inherit(struct relay *ra, struct relay *rb)
 {
 	struct relay_config	 rc;
+	struct relay_table	*rta, *rtb;
 
 	bcopy(&rb->rl_conf, &rc, sizeof(rc));
 	bcopy(ra, rb, sizeof(*rb));
@@ -2723,6 +2754,7 @@ relay_inherit(struct relay *ra, struct relay *rb)
 	rb->rl_conf.port = rc.port;
 	rb->rl_conf.flags =
 	    (ra->rl_conf.flags & ~F_SSL) | (rc.flags & F_SSL);
+	TAILQ_INIT(&rb->rl_tables);
 
 	rb->rl_conf.id = ++last_relay_id;
 	if (last_relay_id == INT_MAX) {
@@ -2748,6 +2780,18 @@ relay_inherit(struct relay *ra, struct relay *rb)
 		goto err;
 	}
 
+	TAILQ_FOREACH(rta, &ra->rl_tables, rlt_entry) {
+		if ((rtb = calloc(1, sizeof(*rtb))) == NULL) {
+			yyerror("cannot allocate relay table");
+			goto err;
+		}
+		rtb->rlt_table = rta->rlt_table;
+		rtb->rlt_mode = rta->rlt_mode;
+		rtb->rlt_flags = rta->rlt_flags;
+
+		TAILQ_INSERT_TAIL(&rb->rl_tables, rtb, rlt_entry);
+	}
+
 	conf->sc_relaycount++;
 	SPLAY_INIT(&rlay->rl_sessions);
 	TAILQ_INSERT_TAIL(conf->sc_relays, rb, rl_entry);
@@ -2755,6 +2799,10 @@ relay_inherit(struct relay *ra, struct relay *rb)
 	return (rb);
 
  err:
+	while ((rtb = TAILQ_FIRST(&rb->rl_tables))) {
+		TAILQ_REMOVE(&rb->rl_tables, rtb, rlt_entry);
+		free(rtb);
+	}
 	free(rb);
 	return (NULL);
 }
@@ -2784,41 +2832,41 @@ getservice(char *n)
 int
 is_if_in_group(const char *ifname, const char *groupname)
 {
-        unsigned int		 len;
-        struct ifgroupreq        ifgr;
-        struct ifg_req          *ifg;
+	unsigned int		 len;
+	struct ifgroupreq	 ifgr;
+	struct ifg_req		*ifg;
 	int			 s;
 	int			 ret = 0;
 
 	if ((s = socket(AF_INET, SOCK_DGRAM, 0)) < 0)
 		err(1, "socket");
 
-        memset(&ifgr, 0, sizeof(ifgr));
-        strlcpy(ifgr.ifgr_name, ifname, IFNAMSIZ);
-        if (ioctl(s, SIOCGIFGROUP, (caddr_t)&ifgr) == -1) {
-                if (errno == EINVAL || errno == ENOTTY)
+	memset(&ifgr, 0, sizeof(ifgr));
+	strlcpy(ifgr.ifgr_name, ifname, IFNAMSIZ);
+	if (ioctl(s, SIOCGIFGROUP, (caddr_t)&ifgr) == -1) {
+		if (errno == EINVAL || errno == ENOTTY)
 			goto end;
 		err(1, "SIOCGIFGROUP");
-        }
+	}
 
-        len = ifgr.ifgr_len;
-        ifgr.ifgr_groups =
-            (struct ifg_req *)calloc(len / sizeof(struct ifg_req),
+	len = ifgr.ifgr_len;
+	ifgr.ifgr_groups =
+	    (struct ifg_req *)calloc(len / sizeof(struct ifg_req),
 		sizeof(struct ifg_req));
-        if (ifgr.ifgr_groups == NULL)
-                err(1, "getifgroups");
-        if (ioctl(s, SIOCGIFGROUP, (caddr_t)&ifgr) == -1)
-                err(1, "SIOCGIFGROUP");
+	if (ifgr.ifgr_groups == NULL)
+		err(1, "getifgroups");
+	if (ioctl(s, SIOCGIFGROUP, (caddr_t)&ifgr) == -1)
+		err(1, "SIOCGIFGROUP");
 
-        ifg = ifgr.ifgr_groups;
-        for (; ifg && len >= sizeof(struct ifg_req); ifg++) {
-                len -= sizeof(struct ifg_req);
+	ifg = ifgr.ifgr_groups;
+	for (; ifg && len >= sizeof(struct ifg_req); ifg++) {
+		len -= sizeof(struct ifg_req);
 		if (strcmp(ifg->ifgrq_group, groupname) == 0) {
 			ret = 1;
 			break;
 		}
-        }
-        free(ifgr.ifgr_groups);
+	}
+	free(ifgr.ifgr_groups);
 
 end:
 	close(s);
