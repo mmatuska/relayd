@@ -1,4 +1,4 @@
-/*	$OpenBSD: relayctl.c,v 1.45 2011/05/20 09:43:53 reyk Exp $	*/
+/*	$OpenBSD: relayctl.c,v 1.48 2013/04/27 16:39:29 benno Exp $	*/
 
 /*
  * Copyright (c) 2006 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -319,11 +319,7 @@ monitor(struct imsg *imsg)
 	imn = monitor_lookup(imsg->hdr.type);
 	printf("%s: imsg type %u len %u peerid %u pid %d\n", imn->name,
 	    imsg->hdr.type, imsg->hdr.len, imsg->hdr.peerid, imsg->hdr.pid);
-#ifdef __FreeBSD__
-	printf("\ttimestamp: %lu, %s", (unsigned long)now, ctime(&now));
-#else
-	printf("\ttimestamp: %u, %s", now, ctime(&now));
-#endif
+	printf("\ttimestamp: %lld, %s", (long long)now, ctime(&now));
 	if (imn->type == -1)
 		done = 1;
 	if (imn->func != NULL)
@@ -458,8 +454,7 @@ show_session_msg(struct imsg *imsg)
 		    a, ntohs(con->se_in.port), b, ntohs(con->se_out.port),
 		    con->se_done ? "DONE" : "RUNNING");
 
-		if (gettimeofday(&tv_now, NULL))
-			fatal("show_session_msg: gettimeofday");
+		getmonotime(&tv_now);
 		print_time(&tv_now, &con->se_tv_start, a, sizeof(a));
 		print_time(&tv_now, &con->se_tv_last, b, sizeof(b));
 		printf("\tage %s, idle %s, relay %u, pid %u",
@@ -570,15 +565,18 @@ print_statistics(struct ctl_stats stats[RELAY_MAXPROC + 1])
 	if (crs.cnt == 0)
 		return;
 	printf("\t%8s\ttotal: %llu sessions\n"
-	    "\t%8s\tlast: %u/%us %u/h %u/d sessions\n"
-	    "\t%8s\taverage: %u/%us %u/h %u/d sessions\n",
-#ifdef __FreeBSD__
-	    "", (long long unsigned)crs.cnt,
-#else
+	    "\t%8s\tlast: %u/%llus %u/h %u/d sessions\n"
+	    "\t%8s\taverage: %u/%llus %u/h %u/d sessions\n",
+#ifndef __FreeBSD__
 	    "", crs.cnt,
-#endif
 	    "", crs.last, crs.interval,
 	    crs.last_hour, crs.last_day,
 	    "", crs.avg, crs.interval,
+#else
+	    "", (long long unsigned int)crs.cnt,
+	    "", crs.last, (long long unsigned int)crs.interval,
+	    crs.last_hour, crs.last_day,
+	    "", crs.avg, (long long unsigned int)crs.interval,
+#endif
 	    crs.avg_hour, crs.avg_day);
 }

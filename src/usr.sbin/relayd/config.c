@@ -1,4 +1,4 @@
-/*	$OpenBSD: config.c,v 1.6 2012/10/04 20:53:30 reyk Exp $	*/
+/*	$OpenBSD: config.c,v 1.8 2012/12/18 15:57:16 reyk Exp $	*/
 
 /*
  * Copyright (c) 2011 Reyk Floeter <reyk@openbsd.org>
@@ -792,7 +792,7 @@ config_getprotonode(struct relayd *env, struct imsg *imsg)
 	if (!c)
 		return (0);
 
-	DPRINTF("%s: %s %d received %d nodes for protocol %s", __func__,
+	DPRINTF("%s: %s %d received %lu nodes for protocol %s", __func__,
 	    env->sc_ps->ps_title[privsep_process], env->sc_ps->ps_instance,
 	    c, proto->name);
 
@@ -960,15 +960,9 @@ config_getrelaytable(struct relayd *env, struct imsg *imsg)
 	struct relay		*rlay;
 	struct table		*table;
 	u_int8_t		*p = imsg->data;
-#ifndef __FreeBSD__ /* variable never used */
-	size_t			 s;
-#endif
 
 	IMSG_SIZE_CHECK(imsg, &crt);
 	memcpy(&crt, p, sizeof(crt));
-#ifndef __FreeBSD__ /* variable never used */
-	s = sizeof(crt);
-#endif
 
 	if ((rlay = relay_find(env, crt.relayid)) == NULL) {
 		log_debug("%s: unknown relay", __func__);
