@@ -1234,7 +1234,12 @@ socket_rlimit(int maxfd)
 
 	if (getrlimit(RLIMIT_NOFILE, &rl) == -1)
 		fatal("socket_rlimit: failed to get resource limit");
+#ifndef __FreeBSD__
 	log_debug("%s: max open files %llu", __func__, rl.rlim_max);
+#else
+	log_debug("%s: max open files %llu", __func__,
+	    (long long unsigned int)rl.rlim_max);
+#endif
 
 	/*
 	 * Allow the maximum number of open file descriptors for this

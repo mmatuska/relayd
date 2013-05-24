@@ -770,8 +770,10 @@ relay_write(struct bufferevent *bev, void *arg)
  done:
 	relay_close(con, "last write (done)");
 	return;
+#ifndef __FreeBSD__
  fail:
 	relay_close(con, strerror(errno));
+#endif
 }
 
 void
@@ -1628,7 +1630,11 @@ relay_close(struct rsession *con, const char *msg)
 			ptr = evbuffer_readline(con->se_log);
 		log_info("relay %s, "
 		    "session %d (%d active), %d, %s -> %s:%d, "
+#ifndef __FreeBSD__
 		    "%s%s%s", rlay->rl_conf.name, con->se_id, relay_sessions,
+#else
+		    "%s%s%s", rlay->rl_conf.name, con->se_id, (int)relay_sessions,
+#endif
 		    con->se_mark, ibuf, obuf, ntohs(con->se_out.port), msg,
 		    ptr == NULL ? "" : ",", ptr == NULL ? "" : ptr);
 		if (ptr != NULL)
@@ -2060,7 +2066,11 @@ relay_ssl_accept(int fd, short event, void *arg)
 	log_debug(
 #endif
 	    "relay %s, session %d established (%d active)",
+#ifndef __FreeBSD__
 	    rlay->rl_conf.name, con->se_id, relay_sessions);
+#else
+	    rlay->rl_conf.name, con->se_id, (int)relay_sessions);
+#endif
 
 	relay_session(con);
 	return;
@@ -2117,7 +2127,11 @@ relay_ssl_connect(int fd, short event, void *arg)
 	log_debug(
 #endif
 	    "relay %s, session %d connected (%d active)",
+#ifndef __FreeBSD__
 	    rlay->rl_conf.name, con->se_id, relay_sessions);
+#else
+	    rlay->rl_conf.name, con->se_id, (int)relay_sessions);
+#endif
 
 	relay_connected(fd, EV_WRITE, con);
 	return;
