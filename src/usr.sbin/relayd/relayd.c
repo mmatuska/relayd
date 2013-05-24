@@ -1,4 +1,4 @@
-/*	$OpenBSD: relayd.c,v 1.111 2012/10/03 08:46:05 reyk Exp $	*/
+/*	$OpenBSD: relayd.c,v 1.116 2013/03/10 23:32:53 reyk Exp $	*/
 
 /*
  * Copyright (c) 2007, 2008 Reyk Floeter <reyk@openbsd.org>
@@ -104,8 +104,9 @@ parent_sig_handler(int sig, short event, void *arg)
 
 			for (id = 0; id < PROC_MAX; id++)
 				if (pid == ps->ps_pid[id]) {
-					log_warnx("lost child: %s %s",
-					    ps->ps_title[id], cause);
+					if (fail)
+						log_warnx("lost child: %s %s",
+						    ps->ps_title[id], cause);
 					break;
 				}
 
@@ -182,7 +183,6 @@ main(int argc, char *argv[])
 	log_init(debug ? debug : 1);	/* log to stderr until daemonized */
 
 	argc -= optind;
-	argv += optind;
 	if (argc > 0)
 		usage();
 
@@ -789,9 +789,7 @@ event_again(struct event *ev, int fd, short event,
 {
 	struct timeval tv_next, tv_now, tv;
 
-	if (gettimeofday(&tv_now, NULL) == -1)
-		fatal("event_again: gettimeofday");
-
+	getmonotime(&tv_now);
 	bcopy(end, &tv_next, sizeof(tv_next));
 	timersub(&tv_now, start, &tv_now);
 	timersub(&tv_next, &tv_now, &tv_next);
@@ -950,7 +948,7 @@ protonode_header(enum direction dir, struct protocol *proto,
 	pn = RB_FIND(proto_tree, tree, pk);
 	if (pn != NULL)
 		return (pn);
-	if ((pn = (struct protonode *)calloc(1, sizeof(*pn))) == NULL) {
+	if ((pn = calloc(1, sizeof(*pn))) == NULL) {
 		log_warn("%s: calloc", __func__);
 		return (NULL);
 	}
@@ -1184,7 +1182,7 @@ socket_rlimit(int maxfd)
 
 	if (getrlimit(RLIMIT_NOFILE, &rl) == -1)
 		fatal("socket_rlimit: failed to get resource limit");
-	log_debug("%s: max open files %d", __func__, rl.rlim_max);
+	log_debug("%s: max open files %llu", __func__, rl.rlim_max);
 
 	/*
 	 * Allow the maximum number of open file descriptors for this

@@ -1,4 +1,4 @@
-/*	$OpenBSD: check_icmp.c,v 1.33 2012/09/19 09:49:24 reyk Exp $	*/
+/*	$OpenBSD: check_icmp.c,v 1.36 2013/03/10 23:32:53 reyk Exp $	*/
 
 /*
  * Copyright (c) 2006 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -58,7 +58,7 @@ icmp_setup(struct relayd *env, struct ctl_icmp_event *cie, int af)
 	if (af == AF_INET6)
 		proto = IPPROTO_ICMPV6;
 	if ((cie->s = socket(af, SOCK_RAW, proto)) < 0)
-		fatal("icmp_init: socket");
+		fatal("icmp_setup: socket");
 	socket_set_blockmode(cie->s, BM_NONBLOCK);
 	cie->env = env;
 	cie->af = af;
@@ -95,8 +95,7 @@ check_icmp_add(struct ctl_icmp_event *cie, int flags, struct timeval *start,
 	if (start != NULL)
 		bcopy(start, &cie->tv_start, sizeof(cie->tv_start));
 	bcopy(&cie->env->sc_timeout, &tv, sizeof(tv));
-	if (gettimeofday(&cie->tv_start, NULL) == -1)
-		fatal("check_icmp_add: gettimeofday");
+	getmonotime(&cie->tv_start);
 	event_del(&cie->ev);
 	event_set(&cie->ev, cie->s, EV_TIMEOUT|flags, fn, cie);
 	event_add(&cie->ev, &tv);
@@ -161,7 +160,7 @@ icmp_checks_timeout(struct ctl_icmp_event *cie, enum host_error he)
 void
 send_icmp(int s, short event, void *arg)
 {
-	struct ctl_icmp_event	*cie = (struct ctl_icmp_event *)arg;
+	struct ctl_icmp_event	*cie = arg;
 	struct table		*table;
 	struct host		*host;
 	struct sockaddr		*to;
@@ -262,7 +261,7 @@ send_icmp(int s, short event, void *arg)
 void
 recv_icmp(int s, short event, void *arg)
 {
-	struct ctl_icmp_event	*cie = (struct ctl_icmp_event *)arg;
+	struct ctl_icmp_event	*cie = arg;
 	u_char			 packet[ICMP_BUF_SIZE];
 	socklen_t		 slen;
 	struct sockaddr_storage	 ss;

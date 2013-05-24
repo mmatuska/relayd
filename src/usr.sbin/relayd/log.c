@@ -1,4 +1,4 @@
-/*	$OpenBSD: log.c,v 1.17 2011/04/12 12:37:22 reyk Exp $	*/
+/*	$OpenBSD: log.c,v 1.19 2013/03/10 23:32:53 reyk Exp $	*/
 
 /*
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -44,8 +44,10 @@
 int	 debug;
 int	 verbose;
 
-void	 vlog(int, const char *, va_list);
-void	 logit(int, const char *, ...);
+void	 vlog(int, const char *, va_list)
+	    __attribute__((__format__ (printf, 2, 0)));
+void	 logit(int, const char *, ...)
+	    __attribute__((__format__ (printf, 2, 3)));
 
 void
 log_init(int n_debug)
@@ -452,4 +454,15 @@ printb_flags(const u_int32_t v, const char *bits)
 	}
 
 	return (r);
+}
+
+void
+getmonotime(struct timeval *tv)
+{
+	struct timespec	 ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts))
+		fatal("clock_gettime");
+
+	TIMESPEC_TO_TIMEVAL(tv, &ts);
 }
