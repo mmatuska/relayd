@@ -1,4 +1,4 @@
-/*	$OpenBSD: parse.y,v 1.170 2013/04/27 16:39:30 benno Exp $	*/
+/*	$OpenBSD: parse.y,v 1.172 2013/09/09 17:57:44 reyk Exp $	*/
 
 /*
  * Copyright (c) 2007-2011 Reyk Floeter <reyk@openbsd.org>
@@ -168,7 +168,7 @@ typedef struct {
 %token	TRANSPARENT TRAP UPDATES URL VIRTUAL WITH TTL RTABLE MATCH
 */
 // Start FreeBSD include
-%token	RANDOM LEASTSTATES SRCHASH
+%token	RANDOM LEASTSTATES SRCHASH KEY CERTIFICATE PASSWORD ECDH CURVE
 %token	SSL STICKYADDR STYLE TABLE TAG TCP TIMEOUT TO
 %token	TRANSPARENT TRAP UPDATES URL VIRTUAL WITH TTL
 // End FreeBSD include
@@ -860,6 +860,7 @@ proto		: relay_proto PROTO STRING	{
 			p->tcpbacklog = RELAY_BACKLOG;
 			(void)strlcpy(p->sslciphers, SSLCIPHERS_DEFAULT,
 			    sizeof(p->sslciphers));
+			p->sslecdhcurve = SSLECDHCURVE_DEFAULT;
 			if (last_proto_id == INT_MAX) {
 				yyerror("too many protocols defined");
 				free(p);
@@ -986,11 +987,49 @@ sslflags	: SESSION CACHE sslcache	{ proto->cache = $3; }
 			}
 			free($2);
 		}
+		| ECDH CURVE STRING		{
+			if (strcmp("none", $3) == 0)
+				proto->sslecdhcurve = 0;
+			else if ((proto->sslecdhcurve = OBJ_sn2nid($3)) == 0) {
+				yyerror("ECDH curve not supported");
+				free($3);
+				YYERROR;
+			}
+			free($3);
+		}
 		| CA FILENAME STRING		{
 			if (strlcpy(proto->sslca, $3,
 			    sizeof(proto->sslca)) >=
 			    sizeof(proto->sslca)) {
 				yyerror("sslca truncated");
+				free($3);
+				YYERROR;
+			}
+			free($3);
+		}
+		| CA KEY STRING PASSWORD STRING	{
+			if (strlcpy(proto->sslcakey, $3,
+			    sizeof(proto->sslcakey)) >=
+			    sizeof(proto->sslcakey)) {
+				yyerror("sslcakey truncated");
+				free($3);
+				free($5);
+				YYERROR;
+			}
+			if ((proto->sslcapass = strdup($5)) == NULL) {
+				yyerror("sslcapass");
+				free($3);
+				free($5);
+				YYERROR;
+			}
+			free($3);
+			free($5);
+		}
+		| CA CERTIFICATE STRING		{
+			if (strlcpy(proto->sslcacert, $3,
+			    sizeof(proto->sslcacert)) >=
+			    sizeof(proto->sslcacert)) {
+				yyerror("sslcacert truncated");
 				free($3);
 				YYERROR;
 			}
@@ -1823,17 +1862,20 @@ lookup(char *s)
 		{ "buffer",		BUFFER },
 		{ "ca",			CA },
 		{ "cache",		CACHE },
+		{ "cert",		CERTIFICATE },
 		{ "change",		CHANGE },
 		{ "check",		CHECK },
 		{ "ciphers",		CIPHERS },
 		{ "code",		CODE },
 		{ "cookie",		COOKIE },
+		{ "curve",		CURVE },
 /* FreeBSD exclude
 		{ "demote",		DEMOTE },
 		{ "destination",	DESTINATION },
 */
 		{ "digest",		DIGEST },
 		{ "disable",		DISABLE },
+		{ "ecdh",		ECDH },
 		{ "error",		ERROR },
 		{ "expect",		EXPECT },
 		{ "external",		EXTERNAL },
@@ -1851,6 +1893,7 @@ lookup(char *s)
 		{ "interface",		INTERFACE },
 		{ "interval",		INTERVAL },
 		{ "ip",			IP },
+		{ "key",		KEY },
 		{ "label",		LABEL },
 		{ "least-states",	LEASTSTATES },
 		{ "listen",		LISTEN },
@@ -1867,6 +1910,7 @@ lookup(char *s)
 		{ "nothing",		NOTHING },
 		{ "on",			ON },
 		{ "parent",		PARENT },
+		{ "password",		PASSWORD },
 		{ "path",		PATH },
 		{ "port",		PORT },
 		{ "prefork",		PREFORK },
