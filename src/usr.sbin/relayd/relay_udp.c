@@ -223,6 +223,8 @@ relay_udp_server(int fd, short sig, void *arg)
 	void *priv = NULL;
 	ssize_t len;
 
+	event_add(&rlay->rl_ev, NULL);
+
 	if (relay_sessions >= RELAY_MAX_SESSIONS ||
 	    rlay->rl_conf.flags & F_DISABLE)
 		return;
@@ -503,7 +505,7 @@ relay_dns_request(struct rsession *con)
 	}
 
 	event_again(&con->se_ev, con->se_out.s, EV_TIMEOUT|EV_READ,
-	    relay_udp_response, &con->se_tv_start, &env->sc_timeout, con);
+	    relay_udp_response, &con->se_tv_start, &rlay->rl_conf.timeout, con);
 
 	return (0);
 }
