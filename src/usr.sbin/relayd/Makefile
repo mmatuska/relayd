@@ -31,12 +31,24 @@ SRCS+=	parse.y \
 	proc.c \
 	config.c
 
+.PATH:	${.CURDIR}/../../../libevent
+SRCS+=	buffer.c \
+	evbuffer.c \
+	event.c \
+	evlog.c \
+	evutil.c \
+	kqueue.c \
+	poll.c \
+	select.c \
+	signal.c
+
 CFLAGS+=	-DSHA1_DIGEST_LENGTH=SHA_DIGEST_LENGTH \
 		-DSHA1_DIGEST_STRING_LENGTH=SHA_DIGEST_LENGTH \
 		-DOPENSSL_NO_SHA -DOPENSSL_NO_MD5 \
-		-D__dead=''
+		-D__dead='' \
+		-DHAVE_CONFIG_H
 CFLAGS+=	-I${.CURDIR} -I${.CURDIR}/../../lib/libutil \
-		-I${PREFIX}/include
+		-I${.CURDIR}/../../../libevent
 CLEANFILES+=	y.tab.h
 
 LDADD=		-lmd -L${PREFIX}/lib ${LIBEVENT} -lssl -lcrypto

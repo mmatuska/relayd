@@ -15,10 +15,11 @@ SRCS+=	relayctl.c \
 
 MAN=	relayctl.8
 
-CFLAGS+=	-D__dead=''
+CFLAGS+=	-D__dead='' \
+		-DHAVE_CONFIG_H
 CFLAGS+=	-I${.CURDIR} \
 		-I${.CURDIR}/../../lib/libutil \
 		-I${.CURDIR}/../relayd \
-		-I${PREFIX}/include
+		-I${.CURDIR}/../../../libevent
 
 .include <bsd.prog.mk>
