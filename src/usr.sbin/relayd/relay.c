@@ -1,7 +1,7 @@
-/*	$OpenBSD: relay.c,v 1.167 2013/09/09 17:57:44 reyk Exp $	*/
+/*	$OpenBSD: relay.c,v 1.175 2014/07/14 00:11:12 bluhm Exp $	*/
 
 /*
- * Copyright (c) 2006 - 2013 Reyk Floeter <reyk@openbsd.org>
+ * Copyright (c) 2006 - 2014 Reyk Floeter <reyk@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -43,6 +43,7 @@
 #include <event.h>
 #include <fnmatch.h>
 
+#include <openssl/dh.h>
 #include <openssl/ssl.h>
 
 #include "relayd.h"
@@ -52,10 +53,12 @@ int		 relay_dispatch_parent(int, struct privsep_proc *,
 		    struct imsg *);
 int		 relay_dispatch_pfe(int, struct privsep_proc *,
 		    struct imsg *);
+int		 relay_dispatch_ca(int, struct privsep_proc *,
+		    struct imsg *);
 void		 relay_shutdown(void);
 
-void		 relay_nodedebug(const char *, struct protonode *);
 void		 relay_protodebug(struct relay *);
+void		 relay_ruledebug(struct relay_rule *);
 void		 relay_init(struct privsep *, struct privsep_proc *p, void *);
 void		 relay_launch(void);
 int		 relay_socket(struct sockaddr_storage *, in_port_t,
@@ -70,6 +73,9 @@ void		 relay_input(struct rsession *);
 
 u_int32_t	 relay_hash_addr(struct sockaddr_storage *, u_int32_t);
 
+DH *		 relay_ssl_get_dhparams(int);
+void		 relay_ssl_callback_info(const SSL *, int, int);
+DH		*relay_ssl_callback_dh(SSL *, int, int);
 SSL_CTX		*relay_ssl_ctx_create(struct relay *);
 void		 relay_ssl_transaction(struct rsession *,
 		    struct ctl_relay_event *);
@@ -81,8 +87,6 @@ void		 relay_ssl_readcb(int, short, void *);
 void		 relay_ssl_writecb(int, short, void *);
 
 char		*relay_load_file(const char *, off_t *);
-static __inline int
-		 relay_proto_cmp(struct protonode *, struct protonode *);
 extern void	 bufferevent_read_pressure_cb(struct evbuffer *, size_t,
 		    size_t, void *);
 
@@ -96,13 +100,17 @@ int				 proc_id;
 static struct privsep_proc procs[] = {
 	{ "parent",	PROC_PARENT,	relay_dispatch_parent },
 	{ "pfe",	PROC_PFE,	relay_dispatch_pfe },
+	{ "ca",		PROC_CA,	relay_dispatch_ca }
 };
 
 pid_t
 relay(struct privsep *ps, struct privsep_proc *p)
 {
+	pid_t	 pid;
 	env = ps->ps_env;
-	return (proc_run(ps, p, procs, nitems(procs), relay_init, NULL));
+	pid = proc_run(ps, p, procs, nitems(procs), relay_init, NULL);
+	relay_http(env);
+	return (pid);
 }
 
 void
@@ -113,74 +121,125 @@ relay_shutdown(void)
 }
 
 void
-relay_nodedebug(const char *name, struct protonode *pn)
+relay_ruledebug(struct relay_rule *rule)
 {
-	const char	*s;
-	int		 digest;
-
-	if (pn->action == NODE_ACTION_NONE)
-		return;
+	struct kv	*kv = NULL;
+	u_int		 i;
 
 	fprintf(stderr, "\t\t");
-	fprintf(stderr, "%s ", name);
 
-	switch (pn->type) {
-	case NODE_TYPE_HEADER:
+	switch (rule->rule_action) {
+	case RULE_ACTION_MATCH:
+		fprintf(stderr, "match ");
 		break;
-	case NODE_TYPE_QUERY:
-		fprintf(stderr, "query ");
+	case RULE_ACTION_BLOCK:
+		fprintf(stderr, "block ");
 		break;
-	case NODE_TYPE_COOKIE:
-		fprintf(stderr, "cookie ");
-		break;
-	case NODE_TYPE_PATH:
-		fprintf(stderr, "path ");
-		break;
-	case NODE_TYPE_URL:
-		fprintf(stderr, "url ");
+	case RULE_ACTION_PASS:
+		fprintf(stderr, "pass ");
 		break;
 	}
 
-	switch (pn->action) {
-	case NODE_ACTION_APPEND:
-		fprintf(stderr, "append \"%s\" to \"%s\"",
-		    pn->value, pn->key);
+	switch (rule->rule_dir) {
+	case RELAY_DIR_ANY:
 		break;
-	case NODE_ACTION_CHANGE:
-		fprintf(stderr, "change \"%s\" to \"%s\"",
-		    pn->key, pn->value);
+	case RELAY_DIR_REQUEST:
+		fprintf(stderr, "request ");
 		break;
-	case NODE_ACTION_REMOVE:
-		fprintf(stderr, "remove \"%s\"",
-		    pn->key);
+	case RELAY_DIR_RESPONSE:
+		fprintf(stderr, "response ");
 		break;
-	case NODE_ACTION_EXPECT:
-	case NODE_ACTION_FILTER:
-		s = pn->action == NODE_ACTION_EXPECT ? "expect" : "filter";
-		digest = pn->flags & PNFLAG_LOOKUP_URL_DIGEST;
-		if (strcmp(pn->value, "*") == 0)
-			fprintf(stderr, "%s %s\"%s\"", s,
-			    digest ? "digest " : "", pn->key);
-		else
-			fprintf(stderr, "%s \"%s\" from \"%s\"", s,
-			    pn->value, pn->key);
-		break;
-	case NODE_ACTION_HASH:
-		fprintf(stderr, "hash \"%s\"", pn->key);
-		break;
-	case NODE_ACTION_LOG:
-		fprintf(stderr, "log \"%s\"", pn->key);
-		break;
-	case NODE_ACTION_MARK:
-		if (strcmp(pn->value, "*") == 0)
-			fprintf(stderr, "mark \"%s\"", pn->key);
-		else
-			fprintf(stderr, "mark \"%s\" from \"%s\"",
-			    pn->value, pn->key);
-		break;
-	case NODE_ACTION_NONE:
+	default:
+		return;
+		/* NOTREACHED */
 		break;
 	}
+
+	if (rule->rule_flags & RULE_FLAG_QUICK)
+		fprintf(stderr, "quick ");
+
+	for (i = 1; i < KEY_TYPE_MAX; i++) {
+		kv = &rule->rule_kv[i];
+		if (kv->kv_type != i)
+			continue;
+
+		switch (kv->kv_type) {
+		case KEY_TYPE_COOKIE:
+			fprintf(stderr, "cookie ");
+			break;
+		case KEY_TYPE_HEADER:
+			fprintf(stderr, "header ");
+			break;
+		case KEY_TYPE_PATH:
+			fprintf(stderr, "path ");
+			break;
+		case KEY_TYPE_QUERY:
+			fprintf(stderr, "query ");
+			break;
+		case KEY_TYPE_URL:
+			fprintf(stderr, "url ");
+			break;
+		default:
+			continue;
+		}
+
+		switch (kv->kv_option) {
+		case KEY_OPTION_APPEND:
+			fprintf(stderr, "append ");
+			break;
+		case KEY_OPTION_SET:
+			fprintf(stderr, "set ");
+			break;
+		case KEY_OPTION_REMOVE:
+			fprintf(stderr, "remove ");
+			break;
+		case KEY_OPTION_HASH:
+			fprintf(stderr, "hash ");
+			break;
+		case KEY_OPTION_LOG:
+			fprintf(stderr, "log ");
+			break;
+		case KEY_OPTION_NONE:
+			break;
+		}
+
+		switch (kv->kv_digest) {
+		case DIGEST_SHA1:
+		case DIGEST_MD5:
+			fprintf(stderr, "digest ");
+			break;
+		default:
+			break;
+		}
+
+		fprintf(stderr, "%s%s%s%s%s%s ",
+		    kv->kv_key == NULL ? "" : "\"",
+		    kv->kv_key == NULL ? "" : kv->kv_key,
+		    kv->kv_key == NULL ? "" : "\"",
+		    kv->kv_value == NULL ? "" : " value \"",
+		    kv->kv_value == NULL ? "" : kv->kv_value,
+		    kv->kv_value == NULL ? "" : "\"");
+	}
+
+	if (rule->rule_tablename[0])
+		fprintf(stderr, "forward to <%s> ", rule->rule_tablename);
+
+	if (rule->rule_tag == -1)
+		fprintf(stderr, "no tag ");
+	else if (rule->rule_tag && rule->rule_tagname[0])
+		fprintf(stderr, "tag \"%s\" ",
+		    rule->rule_tagname);
+
+	if (rule->rule_tagged && rule->rule_taggedname[0])
+		fprintf(stderr, "tagged \"%s\" ",
+		    rule->rule_taggedname);
+
+	if (rule->rule_label == -1)
+		fprintf(stderr, "no label ");
+	else if (rule->rule_label && rule->rule_labelname[0])
+		fprintf(stderr, "label \"%s\" ",
+		    rule->rule_labelname);
+
 	fprintf(stderr, "\n");
 }
 
@@ -188,10 +247,7 @@ void
 relay_protodebug(struct relay *rlay)
 {
 	struct protocol		*proto = rlay->rl_proto;
-	struct protonode	*proot, *pn;
-	struct proto_tree	*tree;
-	const char		*name;
-	int			 i;
+	struct relay_rule	*rule = NULL;
 
 	fprintf(stderr, "protocol %d: name %s\n",
 	    proto->id, proto->name);
@@ -219,32 +275,10 @@ relay_protodebug(struct relay *rlay)
 		break;
 	}
 
-	name = "request";
-	tree = &proto->request_tree;
- show:
-	i = 0;
-	RB_FOREACH(proot, proto_tree, tree) {
-#if DEBUG > 1
-		i = 0;
-#endif
-		PROTONODE_FOREACH(pn, proot, entry) {
-#if DEBUG > 1
-			i = 0;
-#endif
-			if (++i > 100)
-				break;
-			relay_nodedebug(name, pn);
-		}
-		/* Limit the number of displayed lines */
-		if (++i > 100) {
-			fprintf(stderr, "\t\t...\n");
-			break;
-		}
-	}
-	if (tree == &proto->request_tree) {
-		name = "response";
-		tree = &proto->response_tree;
-		goto show;
+	rule = TAILQ_FIRST(&proto->rules);
+	while (rule != NULL) {
+		relay_ruledebug(rule);
+		rule = TAILQ_NEXT(rule, rule_entry);
 	}
 }
 
@@ -263,8 +297,8 @@ relay_privinit(struct relay *rlay)
 		relay_udp_privinit(env, rlay);
 		break;
 	case RELAY_PROTO_TCP:
+		break;
 	case RELAY_PROTO_HTTP:
-		/* Use defaults */
 		break;
 	}
 
@@ -381,6 +415,13 @@ relay_launch(void)
 			fatal("relay_init: failed to create SSL context");
 
 		TAILQ_FOREACH(rlt, &rlay->rl_tables, rlt_entry) {
+			/*
+			 * set rule->rule_table in advance and save time
+			 * looking up for this later on rule/connection
+			 * evalution
+			 */
+			rule_settable(&rlay->rl_proto->rules, rlt);
+
 			switch (rlt->rlt_mode) {
 			case RELAY_DSTMODE_ROUNDROBIN:
 			case RELAY_DSTMODE_RANDOM:
@@ -415,6 +456,7 @@ relay_launch(void)
 			break;
 		case RELAY_PROTO_TCP:
 		case RELAY_PROTO_HTTP:
+			relay_http_init(rlay);
 			/* Use defaults */
 			break;
 		}
@@ -477,8 +519,8 @@ int
 relay_socket(struct sockaddr_storage *ss, in_port_t port,
     struct protocol *proto, int fd, int reuseport)
 {
-	int s = -1, val;
-	struct linger lng;
+	struct linger	lng;
+	int		s = -1, val;
 
 	if (relay_socket_af(ss, port) == -1)
 		goto bad;
@@ -605,7 +647,6 @@ relay_connected(int fd, short sig, void *arg)
 {
 	struct rsession		*con = arg;
 	struct relay		*rlay = con->se_relay;
-	struct protocol		*proto = rlay->rl_proto;
 	evbuffercb		 outrd = relay_read;
 	evbuffercb		 outwr = relay_write;
 	struct bufferevent	*bev;
@@ -632,22 +673,17 @@ relay_connected(int fd, short sig, void *arg)
 		return;
 	}
 
-	DPRINTF("%s: session %d: %ssuccessful", __func__,
-	    con->se_id, rlay->rl_proto->lateconnect ? "late connect " : "");
+	DPRINTF("%s: session %d: successful", __func__, con->se_id);
 
 	switch (rlay->rl_proto->type) {
 	case RELAY_PROTO_HTTP:
-		/* Check the servers's HTTP response */
-		if (!RB_EMPTY(&rlay->rl_proto->response_tree)) {
-			con->se_out.toread = TOREAD_HTTP_HEADER;
-			outrd = relay_read_http;
-			if ((con->se_out.nodes = calloc(proto->response_nodes,
-			    sizeof(u_int8_t))) == NULL) {
-				relay_abort_http(con, 500,
-				    "failed to allocate nodes", 0);
-				return;
-			}
+		if (relay_httpdesc_init(out) == -1) {
+			relay_close(con,
+			    "failed to allocate http descriptor");
+			return;
 		}
+		con->se_out.toread = TOREAD_HTTP_HEADER;
+		outrd = relay_read_http;
 		break;
 	case RELAY_PROTO_TCP:
 		/* Use defaults */
@@ -687,23 +723,18 @@ void
 relay_input(struct rsession *con)
 {
 	struct relay	*rlay = con->se_relay;
-	struct protocol *proto = rlay->rl_proto;
 	evbuffercb	 inrd = relay_read;
 	evbuffercb	 inwr = relay_write;
 
 	switch (rlay->rl_proto->type) {
 	case RELAY_PROTO_HTTP:
-		/* Check the client's HTTP request */
-		if (!RB_EMPTY(&rlay->rl_proto->request_tree) ||
-		    proto->lateconnect) {
-			con->se_in.toread = TOREAD_HTTP_HEADER;
-			inrd = relay_read_http;
-			if ((con->se_in.nodes = calloc(proto->request_nodes,
-			    sizeof(u_int8_t))) == NULL) {
-				relay_close(con, "failed to allocate nodes");
-				return;
-			}
+		if (relay_httpdesc_init(&con->se_in) == -1) {
+			relay_close(con,
+			    "failed to allocate http descriptor");
+			return;
 		}
+		con->se_in.toread = TOREAD_HTTP_HEADER;
+		inrd = relay_read_http;
 		break;
 	case RELAY_PROTO_TCP:
 		/* Use defaults */
@@ -780,6 +811,7 @@ relay_read(struct bufferevent *bev, void *arg)
 	struct evbuffer		*src = EVBUFFER_INPUT(bev);
 
 	getmonotime(&con->se_tv_last);
+	cre->timedout = 0;
 
 	if (!EVBUFFER_LENGTH(src))
 		return;
@@ -795,26 +827,6 @@ relay_read(struct bufferevent *bev, void *arg)
 	return;
  fail:
 	relay_close(con, strerror(errno));
-}
-
-int
-relay_lognode(struct rsession *con, struct protonode *pn, struct protonode *pk,
-    char *buf, size_t len)
-{
-	const char		*label = NULL;
-
-	if ((pn->flags & PNFLAG_LOG) == 0)
-		return (0);
-	bzero(buf, len);
-	if (pn->label != 0)
-		label = pn_id2name(pn->label);
-	if (snprintf(buf, len, " [%s%s%s: %s]",
-	    label == NULL ? "" : label,
-	    label == NULL ? "" : ", ",
-	    pk->key, pk->value) == -1 ||
-	    evbuffer_add(con->se_log, buf, strlen(buf)) == -1)
-		return (-1);
-	return (0);
 }
 
 int
@@ -854,7 +866,7 @@ relay_splice(struct ctl_relay_event *cre)
 	bzero(&sp, sizeof(sp));
 	sp.sp_fd = cre->dst->s;
 	sp.sp_max = cre->toread > 0 ? cre->toread : 0;
-	sp.sp_idle = rlay->rl_conf.timeout;
+	bcopy(&rlay->rl_conf.timeout, &sp.sp_idle, sizeof(sp.sp_idle));
 	if (setsockopt(cre->s, SOL_SOCKET, SO_SPLICE, &sp, sizeof(sp)) == -1) {
 		log_debug("%s: session %d: splice dir %d failed: %s",
 		    __func__, con->se_id, cre->dir, strerror(errno));
@@ -916,9 +928,9 @@ relay_spliceadjust(struct ctl_relay_event *cre)
 void
 relay_error(struct bufferevent *bev, short error, void *arg)
 {
-	struct ctl_relay_event *cre = arg;
-	struct rsession *con = cre->con;
-	struct evbuffer *dst;
+	struct ctl_relay_event	*cre = arg;
+	struct rsession		*con = cre->con;
+	struct evbuffer		*dst;
 
 	if (error & EVBUFFER_TIMEOUT) {
 		if (cre->splicelen >= 0) {
@@ -931,6 +943,7 @@ relay_error(struct bufferevent *bev, short error, void *arg)
 				relay_close(con, "buffer event timeout");
 				break;
 			case 1:
+				cre->timedout = 1;
 				bufferevent_enable(bev, EV_READ);
 				break;
 			}
@@ -951,6 +964,9 @@ relay_error(struct bufferevent *bev, short error, void *arg)
 				bufferevent_enable(bev, EV_READ);
 				break;
 			}
+		} else if (cre->dst->timedout) {
+			relay_close(con, "splice timeout");
+			return;
 		}
 		if (relay_spliceadjust(cre) == -1)
 			goto fail;
@@ -987,14 +1003,13 @@ relay_error(struct bufferevent *bev, short error, void *arg)
 void
 relay_accept(int fd, short event, void *arg)
 {
-	struct relay *rlay = arg;
-	struct protocol *proto = rlay->rl_proto;
-	struct rsession *con = NULL;
-	struct ctl_natlook *cnl = NULL;
-	socklen_t slen;
-	struct timeval tv;
-	struct sockaddr_storage ss;
-	int s = -1;
+	struct relay		*rlay = arg;
+	struct rsession		*con = NULL;
+	struct ctl_natlook	*cnl = NULL;
+	socklen_t		 slen;
+	struct timeval		 tv;
+	struct sockaddr_storage	 ss;
+	int			 s = -1;
 
 	event_add(&rlay->rl_ev, NULL);
 	if ((event & EV_TIMEOUT))
@@ -1042,8 +1057,6 @@ relay_accept(int fd, short event, void *arg)
 	con->se_id = ++relay_conid;
 	con->se_relayid = rlay->rl_conf.id;
 	con->se_pid = getpid();
-	con->se_in.tree = &proto->request_tree;
-	con->se_out.tree = &proto->response_tree;
 	con->se_in.dir = RELAY_DIR_REQUEST;
 	con->se_out.dir = RELAY_DIR_RESPONSE;
 	con->se_retry = rlay->rl_conf.dstretry;
@@ -1076,6 +1089,7 @@ relay_accept(int fd, short event, void *arg)
 	}
 
 	/* Pre-allocate log buffer */
+	con->se_haslog = 0;
 	con->se_log = evbuffer_new();
 	if (con->se_log == NULL) {
 		relay_close(con, "failed to allocate log buffer");
@@ -1247,7 +1261,8 @@ relay_from_table(struct rsession *con)
 		host = TAILQ_NEXT(host, entry);
 	}
 	TAILQ_FOREACH(host, &table->hosts, entry) {
-		DPRINTF("%s: next host %s", __func__, host->conf.name);
+		DPRINTF("%s: session %d: next host %s",
+		    __func__, con->se_id, host->conf.name);
 		if (!table->conf.check || host->up == HOST_UP)
 			goto found;
 	}
@@ -1320,7 +1335,7 @@ relay_session(struct rsession *con)
 		return;
 	}
 
-	if (!rlay->rl_proto->lateconnect) {
+	if (rlay->rl_proto->type != RELAY_PROTO_HTTP) {
 		if (rlay->rl_conf.fwdmode == FWD_TRANS)
 			relay_bindanyreq(con, 0, IPPROTO_TCP);
 		else if (relay_connect(con) == -1) {
@@ -1558,6 +1573,7 @@ relay_close(struct rsession *con, const char *msg)
 {
 	char		 ibuf[128], obuf[128], *ptr = NULL;
 	struct relay	*rlay = con->se_relay;
+	struct protocol	*proto = rlay->rl_proto;
 
 	SPLAY_REMOVE(session_tree, &rlay->rl_sessions, con);
 
@@ -1576,13 +1592,17 @@ relay_close(struct rsession *con, const char *msg)
 		    evbuffer_add_printf(con->se_log, "\r\n") != -1)
 			ptr = evbuffer_readline(con->se_log);
 		log_info("relay %s, "
-		    "session %d (%d active), %d, %s -> %s:%d, "
+		    "session %d (%d active), %s, %s -> %s:%d, "
 		    "%s%s%s", rlay->rl_conf.name, con->se_id, relay_sessions,
-		    con->se_mark, ibuf, obuf, ntohs(con->se_out.port), msg,
-		    ptr == NULL ? "" : ",", ptr == NULL ? "" : ptr);
+		    con->se_tag != 0 ? tag_id2name(con->se_tag) : "0", ibuf,
+		    obuf, ntohs(con->se_out.port), msg, ptr == NULL ? "" : ",",
+		    ptr == NULL ? "" : ptr);
 		if (ptr != NULL)
 			free(ptr);
 	}
+
+	if (proto->close != NULL)
+		(*proto->close)(con);
 
 	if (con->se_priv != NULL)
 		free(con->se_priv);
@@ -1610,12 +1630,8 @@ relay_close(struct rsession *con, const char *msg)
 			    __func__, relay_inflight);
 		}
 	}
-	if (con->se_in.path != NULL)
-		free(con->se_in.path);
 	if (con->se_in.buf != NULL)
 		free(con->se_in.buf);
-	if (con->se_in.nodes != NULL)
-		free(con->se_in.nodes);
 
 	if (con->se_out.bev != NULL)
 		bufferevent_free(con->se_out.bev);
@@ -1639,12 +1655,8 @@ relay_close(struct rsession *con, const char *msg)
 		}
 	}
 
-	if (con->se_out.path != NULL)
-		free(con->se_out.path);
 	if (con->se_out.buf != NULL)
 		free(con->se_out.buf);
-	if (con->se_out.nodes != NULL)
-		free(con->se_out.nodes);
 
 	if (con->se_log != NULL)
 		evbuffer_free(con->se_log);
@@ -1782,6 +1794,12 @@ relay_dispatch_pfe(int fd, struct privsep_proc *p, struct imsg *imsg)
 }
 
 int
+relay_dispatch_ca(int fd, struct privsep_proc *p, struct imsg *imsg)
+{
+	return (-1);
+}
+
+int
 relay_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 {
 	struct rsession		*con;
@@ -1814,8 +1832,9 @@ relay_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 	case IMSG_CFG_PROTO:
 		config_getproto(env, imsg);
 		break;
-	case IMSG_CFG_PROTONODE:
-		return (config_getprotonode(env, imsg));
+	case IMSG_CFG_RULE:
+		config_getrule(env, imsg);
+		break;
 	case IMSG_CFG_RELAY:
 		config_getrelay(env, imsg);
 		break;
@@ -1836,6 +1855,103 @@ relay_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 	}
 
 	return (0);
+}
+
+void
+relay_ssl_callback_info(const SSL *ssl, int where, int rc)
+{
+	struct ctl_relay_event *cre;
+	int ssl_state;
+
+	cre = (struct ctl_relay_event *)SSL_get_app_data(ssl);
+
+	if (cre == NULL || cre->sslreneg_state == SSLRENEG_ALLOW)
+		return;
+
+	ssl_state = SSL_get_state(ssl);
+
+	/* Check renegotiations */
+	if ((where & SSL_CB_ACCEPT_LOOP) &&
+	    (cre->sslreneg_state == SSLRENEG_DENY)) {
+		if ((ssl_state == SSL3_ST_SR_CLNT_HELLO_A) ||
+		    (ssl_state == SSL23_ST_SR_CLNT_HELLO_A)) {
+			/*
+			 * This is a client initiated renegotiation
+			 * that we do not allow
+			 */
+			cre->sslreneg_state = SSLRENEG_ABORT;
+		}
+	} else if ((where & SSL_CB_HANDSHAKE_DONE) &&
+	    (cre->sslreneg_state == SSLRENEG_INIT)) {
+		/*
+		 * This is right after the first handshake,
+		 * disallow any further negotiations.
+		 */
+		cre->sslreneg_state = SSLRENEG_DENY;
+	}
+}
+
+DH *
+relay_ssl_get_dhparams(int keylen)
+{
+	DH		*dh;
+	BIGNUM		*(*prime)(BIGNUM *);
+	const char	*gen;
+
+	gen = "2";
+	if (keylen >= 8192)
+		prime = get_rfc3526_prime_8192;
+	else if (keylen >= 4096)
+		prime = get_rfc3526_prime_4096;
+	else if (keylen >= 3072)
+		prime = get_rfc3526_prime_3072;
+	else if (keylen >= 2048)
+		prime = get_rfc3526_prime_2048;
+	else if (keylen >= 1536)
+		prime = get_rfc3526_prime_1536;
+	else
+		prime = get_rfc2409_prime_1024;
+
+	if ((dh = DH_new()) == NULL)
+		return (NULL);
+
+	dh->p = (*prime)(NULL);
+	BN_dec2bn(&dh->g, gen);
+
+	if (dh->p == NULL || dh->g == NULL) {
+		DH_free(dh);
+		return (NULL);
+	}
+
+	return (dh);
+}
+
+DH *
+relay_ssl_callback_dh(SSL *ssl, int export, int keylen)
+{
+	struct ctl_relay_event	*cre;
+	EVP_PKEY		*pkey;
+	int			 keytype, maxlen;
+	DH			*dh = NULL;
+
+	/* Get maximum key length from config */
+	if ((cre = (struct ctl_relay_event *)SSL_get_app_data(ssl)) == NULL)
+		return (NULL);
+	maxlen = cre->con->se_relay->rl_proto->ssldhparams;
+
+	/* Get the private key length from the cert */
+	if ((pkey = SSL_get_privatekey(ssl))) {
+		keytype = EVP_PKEY_type(pkey->type);
+		if (keytype == EVP_PKEY_RSA || keytype == EVP_PKEY_DSA)
+			keylen = EVP_PKEY_bits(pkey);
+		else
+			return (NULL);
+	}
+
+	/* get built-in params based on the shorter key length */
+	dh = relay_ssl_get_dhparams(MIN(keylen, maxlen));
+
+	return (dh);
 }
 
 SSL_CTX *
@@ -1864,6 +1980,8 @@ relay_ssl_ctx_create(struct relay *rlay)
 	SSL_CTX_set_options(ctx, SSL_OP_ALL);
 	SSL_CTX_set_options(ctx,
 	    SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION);
+	if (proto->sslflags & SSLFLAG_CIPHER_SERVER_PREF)
+		SSL_CTX_set_options(ctx, SSL_OP_CIPHER_SERVER_PREFERENCE);
 
 	/* Set the allowed SSL protocols */
 	if ((proto->sslflags & SSLFLAG_SSLV2) == 0)
@@ -1873,6 +1991,9 @@ relay_ssl_ctx_create(struct relay *rlay)
 	if ((proto->sslflags & SSLFLAG_TLSV1) == 0)
 		SSL_CTX_set_options(ctx, SSL_OP_NO_TLSv1);
 
+	/* add the SSL info callback */
+	SSL_CTX_set_info_callback(ctx, relay_ssl_callback_info);
+
 	if (proto->sslecdhcurve > 0) {
 		/* Enable ECDHE support for TLS perfect forward secrecy */
 		if ((ecdhkey =
@@ -1881,6 +2002,11 @@ relay_ssl_ctx_create(struct relay *rlay)
 		SSL_CTX_set_tmp_ecdh(ctx, ecdhkey);
 		SSL_CTX_set_options(ctx, SSL_OP_SINGLE_ECDH_USE);
 		EC_KEY_free(ecdhkey);
+	}
+
+	if (proto->ssldhparams > 0) {
+		/* Enable EDH params (forward secrecy for older clients) */
+		SSL_CTX_set_tmp_dh_callback(ctx, relay_ssl_callback_dh);
 	}
 
 	if (!SSL_CTX_set_cipher_list(ctx, proto->sslciphers))
@@ -1904,16 +2030,32 @@ relay_ssl_ctx_create(struct relay *rlay)
 		goto err;
 
 	log_debug("%s: loading private key", __func__);
-	if (!ssl_ctx_use_private_key(ctx, rlay->rl_ssl_key,
-	    rlay->rl_conf.ssl_key_len))
+	if (!ssl_ctx_fake_private_key(ctx,
+	    &rlay->rl_conf.ssl_keyid, sizeof(rlay->rl_conf.ssl_keyid),
+	    rlay->rl_ssl_cert, rlay->rl_conf.ssl_cert_len,
+	    &rlay->rl_ssl_x509, &rlay->rl_ssl_pkey))
 		goto err;
+
 	if (!SSL_CTX_check_private_key(ctx))
 		goto err;
+
+	if (rlay->rl_conf.ssl_cacert_len) {
+		log_debug("%s: loading CA private key", __func__);
+		if (!ssl_load_pkey(&rlay->rl_conf.ssl_cakeyid,
+		    sizeof(rlay->rl_conf.ssl_cakeyid),
+		    rlay->rl_ssl_cacert, rlay->rl_conf.ssl_cacert_len,
+		    &rlay->rl_ssl_cacertx509, &rlay->rl_ssl_capkey))
+			goto err;
+	}
 
 	/* Set session context to the local relay name */
 	if (!SSL_CTX_set_session_id_context(ctx, rlay->rl_conf.name,
 	    strlen(rlay->rl_conf.name)))
 		goto err;
+
+	/* The text versions of the keys/certs are not needed anymore */
+	purge_key(&rlay->rl_ssl_cert, rlay->rl_conf.ssl_cert_len);
+	purge_key(&rlay->rl_ssl_cacert, rlay->rl_conf.ssl_cacert_len);
 
 	return (ctx);
 
@@ -1928,6 +2070,7 @@ void
 relay_ssl_transaction(struct rsession *con, struct ctl_relay_event *cre)
 {
 	struct relay		*rlay = con->se_relay;
+	struct protocol	*proto = rlay->rl_proto;
 	SSL			*ssl;
 	const SSL_METHOD	*method;
 	void			(*cb)(int, short, void *);
@@ -1956,11 +2099,21 @@ relay_ssl_transaction(struct rsession *con, struct ctl_relay_event *cre)
 	if (!SSL_set_fd(ssl, cre->s))
 		goto err;
 
-	if (cre->dir == RELAY_DIR_REQUEST)
+	if (cre->dir == RELAY_DIR_REQUEST) {
+		if ((proto->sslflags & SSLFLAG_CLIENT_RENEG) == 0)
+			/* Only allow negotiation during the first handshake */
+			cre->sslreneg_state = SSLRENEG_INIT;
+		else
+			/* Allow client initiated renegotiations */
+			cre->sslreneg_state = SSLRENEG_ALLOW;
 		SSL_set_accept_state(ssl);
-	else
+	} else {
+		/* Always allow renegotiations if we're the client */
+		cre->sslreneg_state = SSLRENEG_ALLOW;
 		SSL_set_connect_state(ssl);
+	}
 
+	SSL_set_app_data(ssl, cre);
 	cre->ssl = ssl;
 
 	DPRINTF("%s: session %d: scheduling on %s", __func__, con->se_id,
@@ -2087,9 +2240,8 @@ relay_ssl_connect(int fd, short event, void *arg)
 		    SSL_get_peer_certificate(con->se_out.ssl)) != NULL) {
 			con->se_in.sslcert =
 			    ssl_update_certificate(servercert,
-			    rlay->rl_ssl_key, rlay->rl_conf.ssl_key_len,
-			    rlay->rl_ssl_cakey, rlay->rl_conf.ssl_cakey_len,
-			    rlay->rl_ssl_cacert, rlay->rl_conf.ssl_cacert_len);
+			    rlay->rl_ssl_pkey, rlay->rl_ssl_capkey,
+			    rlay->rl_ssl_cacertx509);
 		} else
 			con->se_in.sslcert = NULL;
 		if (servercert != NULL)
@@ -2127,18 +2279,23 @@ relay_ssl_connected(struct ctl_relay_event *cre)
 void
 relay_ssl_readcb(int fd, short event, void *arg)
 {
-	char rbuf[IBUF_READ_SIZE];
-	struct bufferevent *bufev = arg;
-	struct ctl_relay_event *cre = bufev->cbarg;
-	struct rsession *con = cre->con;
-	struct relay *rlay = con->se_relay;
-	int ret = 0, ssl_err = 0;
-	short what = EVBUFFER_READ;
-	int howmuch = IBUF_READ_SIZE;
-	size_t len;
+	char			 rbuf[IBUF_READ_SIZE];
+	struct bufferevent	*bufev = arg;
+	struct ctl_relay_event	*cre = bufev->cbarg;
+	struct rsession		*con = cre->con;
+	struct relay		*rlay = con->se_relay;
+	int			 ret = 0, ssl_err = 0;
+	short			 what = EVBUFFER_READ;
+	int			 howmuch = IBUF_READ_SIZE;
+	size_t			 len;
 
 	if (event == EV_TIMEOUT) {
 		what |= EVBUFFER_TIMEOUT;
+		goto err;
+	}
+
+	if (cre->sslreneg_state == SSLRENEG_ABORT) {
+		what |= EVBUFFER_ERROR;
 		goto err;
 	}
 
@@ -2202,15 +2359,20 @@ relay_ssl_readcb(int fd, short event, void *arg)
 void
 relay_ssl_writecb(int fd, short event, void *arg)
 {
-	struct bufferevent *bufev = arg;
-	struct ctl_relay_event *cre = bufev->cbarg;
-	struct rsession *con = cre->con;
-	struct relay *rlay = con->se_relay;
-	int ret = 0, ssl_err;
-	short what = EVBUFFER_WRITE;
+	struct bufferevent	*bufev = arg;
+	struct ctl_relay_event	*cre = bufev->cbarg;
+	struct rsession		*con = cre->con;
+	struct relay		*rlay = con->se_relay;
+	int			 ret = 0, ssl_err;
+	short			 what = EVBUFFER_WRITE;
 
 	if (event == EV_TIMEOUT) {
 		what |= EVBUFFER_TIMEOUT;
+		goto err;
+	}
+
+        if (cre->sslreneg_state == SSLRENEG_ABORT) {
+		what |= EVBUFFER_ERROR;
 		goto err;
 	}
 
@@ -2297,8 +2459,8 @@ relay_bufferevent_add(struct event *ev, int timeout)
 int
 relay_bufferevent_printf(struct ctl_relay_event *cre, const char *fmt, ...)
 {
-	int ret;
-	va_list ap;
+	int	ret;
+	va_list	ap;
 
 	va_start(ap, fmt);
 	ret = evbuffer_add_vprintf(cre->output, fmt, ap);
@@ -2314,7 +2476,7 @@ relay_bufferevent_printf(struct ctl_relay_event *cre, const char *fmt, ...)
 #endif
 
 int
-relay_bufferevent_print(struct ctl_relay_event *cre, char *str)
+relay_bufferevent_print(struct ctl_relay_event *cre, const char *str)
 {
 	if (cre->bev == NULL)
 		return (evbuffer_add(cre->output, str, strlen(str)));
@@ -2352,9 +2514,9 @@ relay_bufferevent_write(struct ctl_relay_event *cre, void *data, size_t size)
 int
 relay_cmp_af(struct sockaddr_storage *a, struct sockaddr_storage *b)
 {
-	int ret = -1;
-	struct sockaddr_in ia, ib;
-	struct sockaddr_in6 ia6, ib6;
+	int			ret = -1;
+	struct sockaddr_in	ia, ib;
+	struct sockaddr_in6	ia6, ib6;
 
 	switch (a->ss_family) {
 	case AF_INET:
@@ -2487,16 +2649,6 @@ relay_load_certfiles(struct relay *rlay)
 	return (0);
 }
 
-static __inline int
-relay_proto_cmp(struct protonode *a, struct protonode *b)
-{
-	int ret;
-	ret = strcasecmp(a->key, b->key);
-	if (ret == 0)
-		ret = (int)a->type - b->type;
-	return (ret);
-}
-
 int
 relay_session_cmp(struct rsession *a, struct rsession *b)
 {
@@ -2509,5 +2661,12 @@ relay_session_cmp(struct rsession *a, struct rsession *b)
 	return ((int)a->se_id - b->se_id);
 }
 
-RB_GENERATE(proto_tree, protonode, nodes, relay_proto_cmp);
+void
+relay_log(struct rsession *con, char *msg)
+{
+	if (con->se_haslog && con->se_log != NULL) {
+		evbuffer_add(con->se_log, msg, strlen(msg));
+	}
+}
+
 SPLAY_GENERATE(session_tree, rsession, se_nodes, relay_session_cmp);

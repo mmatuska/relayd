@@ -1,5 +1,6 @@
-.\" $OpenBSD: relayctl.8,v 1.27 2011/05/19 08:56:49 reyk Exp $
+.\" $OpenBSD: relayctl.8,v 1.29 2014/06/25 11:12:45 reyk Exp $
 .\"
+.\" Copyright (c) 2007 - 2013 Reyk Floeter <reyk@openbsd.org>
 .\" Copyright (c) 2006 Pierre-Yves Ritschard <pyr@openbsd.org>
 .\"
 .\" Permission to use, copy, modify, and distribute this software for any
@@ -14,7 +15,7 @@
 .\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 .\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 .\"
-.Dd $Mdocdate: May 19 2011 $
+.Dd $Mdocdate: June 25 2014 $
 .Dt RELAYCTL 8
 .Os
 .Sh NAME
@@ -64,7 +65,7 @@ Reload the configuration file.
 Show detailed status of hosts and tables.
 It will also print the last error for failed host checks;
 see the
-.Sx ERRORS
+.Sx DIAGNOSTICS
 section below.
 .It Cm show redirects
 Show detailed status of redirections including the current and average
@@ -99,12 +100,12 @@ again.
 .El
 .Sh FILES
 .Bl -tag -width "/var/run/relayd.sockXX" -compact
-.It /var/run/relayd.sock
+.It Pa /var/run/relayd.sock
 .Ux Ns -domain
 socket used for communication with
 .Xr relayd 8 .
 .El
-.Sh ERRORS
+.Sh DIAGNOSTICS
 If a host is down and a previous check failed,
 .Nm
 will display the last error in the output of the

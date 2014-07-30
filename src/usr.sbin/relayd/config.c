@@ -1,7 +1,7 @@
-/*	$OpenBSD: config.c,v 1.10 2013/09/09 17:57:44 reyk Exp $	*/
+/*	$OpenBSD: config.c,v 1.18 2014/07/11 16:59:38 reyk Exp $	*/
 
 /*
- * Copyright (c) 2011 Reyk Floeter <reyk@openbsd.org>
+ * Copyright (c) 2011 - 2014 Reyk Floeter <reyk@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -64,8 +64,9 @@ config_init(struct relayd *env)
 		ps->ps_what[PROC_PARENT] = CONFIG_ALL;
 		ps->ps_what[PROC_PFE] = CONFIG_ALL & ~CONFIG_PROTOS;
 		ps->ps_what[PROC_HCE] = CONFIG_TABLES;
-		ps->ps_what[PROC_RELAY] =
-		    CONFIG_TABLES|CONFIG_RELAYS|CONFIG_PROTOS;
+		ps->ps_what[PROC_CA] = CONFIG_RELAYS;
+		ps->ps_what[PROC_RELAY] = CONFIG_RELAYS|
+		    CONFIG_TABLES|CONFIG_PROTOS|CONFIG_CA_ENGINE;
 	}
 
 	/* Other configuration */
@@ -95,6 +96,10 @@ config_init(struct relayd *env)
 		    calloc(1, sizeof(*env->sc_relays))) == NULL)
 			return (-1);
 		TAILQ_INIT(env->sc_relays);
+		if ((env->sc_pkeys =
+		    calloc(1, sizeof(*env->sc_pkeys))) == NULL)
+			return (-1);
+		TAILQ_INIT(env->sc_pkeys);
 	}
 	if (what & CONFIG_PROTOS) {
 		if ((env->sc_protos =
@@ -113,11 +118,10 @@ config_init(struct relayd *env)
 		    SSLCIPHERS_DEFAULT,
 		    sizeof(env->sc_proto_default.sslciphers));
 		env->sc_proto_default.sslecdhcurve = SSLECDHCURVE_DEFAULT;
+		env->sc_proto_default.ssldhparams = SSLDHPARAMS_DEFAULT;
 		env->sc_proto_default.type = RELAY_PROTO_TCP;
 		(void)strlcpy(env->sc_proto_default.name, "default",
 		    sizeof(env->sc_proto_default.name));
-		RB_INIT(&env->sc_proto_default.request_tree);
-		RB_INIT(&env->sc_proto_default.response_tree);
 	}
 	if (what & CONFIG_RTS) {
 		if ((env->sc_rts =
@@ -143,9 +147,11 @@ config_purge(struct relayd *env, u_int reset)
 	struct rdr		*rdr;
 	struct address		*virt;
 	struct protocol		*proto;
+	struct relay_rule	*rule;
 	struct relay		*rlay;
 	struct netroute		*nr;
 	struct router		*rt;
+	struct ca_pkey		*pkey;
 	u_int			 what;
 
 	what = ps->ps_what[privsep_process] & reset;
@@ -166,6 +172,12 @@ config_purge(struct relayd *env, u_int reset)
 		}
 		env->sc_rdrcount = 0;
 	}
+	if (what & CONFIG_RELAYS && env->sc_pkeys != NULL) {
+		while ((pkey = TAILQ_FIRST(env->sc_pkeys)) != NULL) {
+			TAILQ_REMOVE(env->sc_pkeys, pkey, pkey_entry);
+			free(pkey);
+		}
+	}
 	if (what & CONFIG_RELAYS && env->sc_relays != NULL) {
 		while ((rlay = TAILQ_FIRST(env->sc_relays)) != NULL)
 			purge_relay(env, rlay);
@@ -174,8 +186,14 @@ config_purge(struct relayd *env, u_int reset)
 	if (what & CONFIG_PROTOS && env->sc_protos != NULL) {
 		while ((proto = TAILQ_FIRST(env->sc_protos)) != NULL) {
 			TAILQ_REMOVE(env->sc_protos, proto, entry);
-			purge_tree(&proto->request_tree);
-			purge_tree(&proto->response_tree);
+			while ((rule = TAILQ_FIRST(&proto->rules)) != NULL)
+				rule_delete(&proto->rules, rule);
+			proto->rulecount = 0;
+		}
+	}
+	if (what & CONFIG_PROTOS && env->sc_protos != NULL) {
+		while ((proto = TAILQ_FIRST(env->sc_protos)) != NULL) {
+			TAILQ_REMOVE(env->sc_protos, proto, entry);
 			if (proto->style != NULL)
 				free(proto->style);
 			if (proto->sslcapass != NULL)
@@ -245,6 +263,7 @@ config_getcfg(struct relayd *env, struct imsg *imsg)
 	struct table		*tb;
 	struct host		*h, *ph;
 	struct ctl_flags	 cf;
+	u_int			 what;
 
 	if (IMSG_DATA_SIZE(imsg) != sizeof(cf))
 		return (0); /* ignore */
@@ -254,7 +273,9 @@ config_getcfg(struct relayd *env, struct imsg *imsg)
 	env->sc_opts = cf.cf_opts;
 	env->sc_flags = cf.cf_flags;
 
-	if (ps->ps_what[privsep_process] & CONFIG_TABLES) {
+	what = ps->ps_what[privsep_process];
+
+	if (what & CONFIG_TABLES) {
 		/* Update the tables */
 		TAILQ_FOREACH(tb, env->sc_tables, entry) {
 			TAILQ_FOREACH(h, &tb->hosts, entry) {
@@ -267,8 +288,11 @@ config_getcfg(struct relayd *env, struct imsg *imsg)
 		}
 	}
 
-	if (env->sc_flags & (F_SSL|F_SSLCLIENT))
+	if (env->sc_flags & (F_SSL|F_SSLCLIENT)) {
 		ssl_init(env);
+		if (what & CONFIG_CA_ENGINE)
+			ca_engine_init(env);
+	}
 
 	if (privsep_process != PROC_PARENT)
 		proc_compose_imsg(env->sc_ps, PROC_PARENT, -1,
@@ -579,7 +603,7 @@ config_setproto(struct relayd *env, struct protocol *proto)
 {
 	struct privsep		*ps = env->sc_ps;
 	int			 id;
-	struct iovec		 iov[2];
+	struct iovec		 iov[IOV_MAX];
 	size_t			 c;
 
 	for (id = 0; id < PROC_MAX; id++) {
@@ -599,15 +623,60 @@ config_setproto(struct relayd *env, struct protocol *proto)
 			iov[c++].iov_len = strlen(proto->style);
 		}
 
-		/* XXX struct protocol should be split */
 		proc_composev_imsg(ps, id, -1, IMSG_CFG_PROTO, -1, iov, c);
+	}
 
-		/* Now send all the protocol key/value nodes */
-		if (config_setprotonode(env, id, proto,
-		    RELAY_DIR_REQUEST) == -1 ||
-		    config_setprotonode(env, id, proto,
-		    RELAY_DIR_RESPONSE) == -1)
-			return (-1);
+	return (0);
+}
+
+int
+config_setrule(struct relayd *env, struct protocol *proto)
+{
+	struct privsep		*ps = env->sc_ps;
+	struct relay_rule	*rule;
+	struct iovec		 iov[IOV_MAX];
+	int			 id;
+	size_t			 c, i;
+
+	for (id = 0; id < PROC_MAX; id++) {
+		if ((ps->ps_what[id] & CONFIG_PROTOS) == 0 ||
+		    id == privsep_process)
+			continue;
+
+		DPRINTF("%s: sending rules %s to %s", __func__,
+		    proto->name, ps->ps_title[id]);
+
+		/* Now send all the rules */
+		TAILQ_FOREACH(rule, &proto->rules, rule_entry) {
+			rule->rule_protoid = proto->id;
+			bzero(&rule->rule_ctl, sizeof(rule->rule_ctl));
+			c = 0;
+			iov[c].iov_base = rule;
+			iov[c++].iov_len = sizeof(*rule);
+			for (i = 1; i < KEY_TYPE_MAX; i++) {
+				if (rule->rule_kv[i].kv_key != NULL) {
+					rule->rule_ctl.kvlen[i].key =
+					    strlen(rule->rule_kv[i].kv_key);
+					iov[c].iov_base =
+					    rule->rule_kv[i].kv_key;
+					iov[c++].iov_len =
+					    rule->rule_ctl.kvlen[i].key;
+				} else
+					rule->rule_ctl.kvlen[i].key = -1;
+				if (rule->rule_kv[i].kv_value != NULL) {
+					rule->rule_ctl.kvlen[i].value =
+					    strlen(rule->rule_kv[i].kv_value);
+					iov[c].iov_base =
+					    rule->rule_kv[i].kv_value;
+					iov[c++].iov_len =
+					    rule->rule_ctl.kvlen[i].value;
+				} else
+					rule->rule_ctl.kvlen[i].value = -1;
+			}
+
+			proc_composev_imsg(ps, id, -1,
+			    IMSG_CFG_RULE, -1, iov, c);
+		}
 	}
 
 	return (0);
@@ -636,11 +705,8 @@ config_getproto(struct relayd *env, struct imsg *imsg)
 		}
 	}
 
-	proto->request_nodes = 0;
-	proto->response_nodes = 0;
+	TAILQ_INIT(&proto->rules);
 	proto->sslcapass = NULL;
-	RB_INIT(&proto->request_tree);
-	RB_INIT(&proto->response_tree);
 
 	TAILQ_INSERT_TAIL(env->sc_protos, proto, entry);
 
@@ -654,144 +720,70 @@ config_getproto(struct relayd *env, struct imsg *imsg)
 }
 
 int
-config_setprotonode(struct relayd *env, enum privsep_procid id,
-    struct protocol *proto, enum direction dir)
+config_getrule(struct relayd *env, struct imsg *imsg)
 {
-	struct privsep		*ps = env->sc_ps;
-	struct iovec		 iov[IOV_MAX];
-	size_t			 c, sz;
-	struct protonode	*proot, *pn;
-	struct proto_tree	*tree;
+	struct protocol		*proto;
+	struct relay_rule	*rule;
+	size_t			 s, i;
+	u_int8_t		*p = imsg->data;
+	ssize_t			 len;
 
-	if (dir == RELAY_DIR_RESPONSE)
-		tree = &proto->response_tree;
-	else
-		tree = &proto->request_tree;
+	if ((rule = calloc(1, sizeof(*rule))) == NULL)
+		return (-1);
 
-	sz = c = 0;
-	RB_FOREACH(proot, proto_tree, tree) {
-		PROTONODE_FOREACH(pn, proot, entry) {
-			pn->conf.protoid = proto->id;
-			pn->conf.dir = dir;
-			pn->conf.keylen = pn->key ? strlen(pn->key) : 0;
-			pn->conf.valuelen = pn->value ? strlen(pn->value) : 0;
-			if (pn->label != 0 && pn->labelname == NULL)
-				pn->labelname = strdup(pn_id2name(pn->label));
-			pn->conf.labelnamelen = pn->labelname ?
-			    strlen(pn->labelname) : 0;
+	IMSG_SIZE_CHECK(imsg, rule);
+	memcpy(rule, p, sizeof(*rule));
+	s = sizeof(*rule);
+	len = IMSG_DATA_SIZE(imsg) - s;
 
-			pn->conf.len = sizeof(*pn) +
-			    pn->conf.keylen + pn->conf.valuelen +
-			    pn->conf.labelnamelen;
-
-			if (pn->conf.len > (MAX_IMSGSIZE - IMSG_HEADER_SIZE))
-				return (-1);
-
-			if (c && ((c + 3) >= IOV_MAX || (sz + pn->conf.len) >
-			    (MAX_IMSGSIZE - IMSG_HEADER_SIZE))) {
-				proc_composev_imsg(ps, id, -1,
-				    IMSG_CFG_PROTONODE, -1, iov, c);
-				c = sz = 0;
-			}
-
-			iov[c].iov_base = pn;
-			iov[c++].iov_len = sizeof(*pn);
-			if (pn->conf.keylen) {
-				iov[c].iov_base = pn->key;
-				iov[c++].iov_len = pn->conf.keylen;
-			}
-			if (pn->conf.valuelen) {
-				iov[c].iov_base = pn->value;
-				iov[c++].iov_len = pn->conf.valuelen;
-			}
-			if (pn->conf.labelnamelen) {
-				iov[c].iov_base = pn->labelname;
-				iov[c++].iov_len = pn->conf.labelnamelen;
-			}
-			sz += pn->conf.len;
-		}
+	if ((proto = proto_find(env, rule->rule_protoid)) == NULL) {
+		free(rule);
+		return (-1);
 	}
 
-	if (c && sz)
-		proc_composev_imsg(ps, id, -1, IMSG_CFG_PROTONODE, -1, iov, c);
-
-	return (0);
+#define GETKV(_n, _f)	{						\
+	if (rule->rule_ctl.kvlen[_n]._f >= 0) {				\
+		/* Also accept "empty" 0-length strings */		\
+		if ((len < rule->rule_ctl.kvlen[_n]._f) ||		\
+		    (rule->rule_kv[_n].kv_##_f =			\
+		    get_string(p + s,					\
+		    rule->rule_ctl.kvlen[_n]._f)) == NULL) {		\
+			free(rule);					\
+			return (-1);					\
+		}							\
+		s += rule->rule_ctl.kvlen[_n]._f;			\
+		len -= rule->rule_ctl.kvlen[_n]._f;			\
+									\
+		DPRINTF("%s: %s %s (len %ld, option %d): %s", __func__,	\
+		    #_n, #_f, rule->rule_ctl.kvlen[_n]._f,		\
+		    rule->rule_kv[_n].kv_option,			\
+		    rule->rule_kv[_n].kv_##_f);				\
+	}								\
 }
 
-int
-config_getprotonode(struct relayd *env, struct imsg *imsg)
-{
-	struct protocol		*proto = NULL;
-	struct protonode	 pn;
-	size_t			 z, s, c = 0;
-	u_int8_t		*p = imsg->data;
-
-	bzero(&pn, sizeof(pn));
-
-	IMSG_SIZE_CHECK(imsg, &pn);
-	for (z = 0; z < (IMSG_DATA_SIZE(imsg) - sizeof(pn)); z += pn.conf.len) {
-		s = z;
-		memcpy(&pn, p + s, sizeof(pn));
-		s += sizeof(pn);
-
-		if ((proto = proto_find(env, pn.conf.protoid)) == NULL) {
-			log_debug("%s: unknown protocol %d", __func__,
-			    pn.conf.protoid);
-			return (-1);
-		}
-
-		pn.key = pn.value = pn.labelname = NULL;
-		bzero(&pn.entry, sizeof(pn.entry));
-		bzero(&pn.nodes, sizeof(pn.nodes));
-		bzero(&pn.head, sizeof(pn.head));
-
-		if (pn.conf.keylen) {
-			if ((pn.key = get_string(p + s,
-			    pn.conf.keylen)) == NULL) {
-				log_debug("%s: failed to get key", __func__);
-				return (-1);
-			}
-			s += pn.conf.keylen;
-		}
-		if (pn.conf.valuelen) {
-			if ((pn.value = get_string(p + s,
-			    pn.conf.valuelen)) == NULL) {
-				log_debug("%s: failed to get value", __func__);
-				if (pn.key != NULL)
-					free(pn.key);
-				return (-1);
-			}
-			s += pn.conf.valuelen;
-		}
-		if (pn.conf.labelnamelen) {
-			if ((pn.labelname = get_string(p + s,
-			    pn.conf.labelnamelen)) == NULL) {
-				log_debug("%s: failed to get labelname",
-				    __func__);
-				return (-1);
-			}
-			s += pn.conf.labelnamelen;
-		}
-
-		if (protonode_add(pn.conf.dir, proto, &pn) == -1) {
-			if (pn.key != NULL)
-				free(pn.key);
-			if (pn.value != NULL)
-				free(pn.value);
-			if (pn.labelname != NULL)
-				free(pn.labelname);
-			log_debug("%s: failed to add protocol node", __func__);
-			return (-1);
-		}
-		c++;
+	memset(&rule->rule_kv[0], 0, sizeof(struct kv));
+	for (i = 1; i < KEY_TYPE_MAX; i++) {
+		TAILQ_INIT(&rule->rule_kv[i].kv_children);
+		GETKV(i, key);
+		GETKV(i, value);
 	}
 
-	if (!c)
-		return (0);
+	if (rule->rule_labelname[0])
+		rule->rule_label = label_name2id(rule->rule_labelname);
 
-	DPRINTF("%s: %s %d received %lu nodes for protocol %s", __func__,
+	if (rule->rule_tagname[0])
+		rule->rule_tag = tag_name2id(rule->rule_tagname);
+
+	if (rule->rule_taggedname[0])
+		rule->rule_tagged = tag_name2id(rule->rule_taggedname);
+
+	rule->rule_id = proto->rulecount++;
+
+	TAILQ_INSERT_TAIL(&proto->rules, rule, rule_entry);
+
+	DPRINTF("%s: %s %d received rule %u for protocol %s", __func__,
 	    env->sc_ps->ps_title[privsep_process], env->sc_ps->ps_instance,
-	    c, proto->name);
+	    rule->rule_id, proto->name);
 
 	return (0);
 }
@@ -802,46 +794,55 @@ config_setrelay(struct relayd *env, struct relay *rlay)
 	struct privsep		*ps = env->sc_ps;
 	struct ctl_relaytable	 crt;
 	struct relay_table	*rlt;
+	struct relay_config	 rl;
 	int			 id;
 	int			 fd, n, m;
-	struct iovec		 iov[4];
+	struct iovec		 iov[6];
 	size_t			 c;
+	u_int			 what;
 
 	/* opens listening sockets etc. */
 	if (relay_privinit(rlay) == -1)
 		return (-1);
 
 	for (id = 0; id < PROC_MAX; id++) {
-		if ((ps->ps_what[id] & CONFIG_RELAYS) == 0 ||
-		    id == privsep_process)
+		what = ps->ps_what[id];
+
+		if ((what & CONFIG_RELAYS) == 0 || id == privsep_process)
 			continue;
 
 		DPRINTF("%s: sending relay %s to %s fd %d", __func__,
 		    rlay->rl_conf.name, ps->ps_title[id], rlay->rl_s);
 
+		memcpy(&rl, &rlay->rl_conf, sizeof(rl));
+
 		c = 0;
-		iov[c].iov_base = &rlay->rl_conf;
-		iov[c++].iov_len = sizeof(rlay->rl_conf);
-		if (rlay->rl_conf.ssl_cert_len) {
+		iov[c].iov_base = &rl;
+		iov[c++].iov_len = sizeof(rl);
+		if (rl.ssl_cert_len) {
 			iov[c].iov_base = rlay->rl_ssl_cert;
-			iov[c++].iov_len = rlay->rl_conf.ssl_cert_len;
+			iov[c++].iov_len = rl.ssl_cert_len;
 		}
-		if (rlay->rl_conf.ssl_key_len) {
+		if ((what & CONFIG_CA_ENGINE) == 0 &&
+		    rl.ssl_key_len) {
 			iov[c].iov_base = rlay->rl_ssl_key;
-			iov[c++].iov_len = rlay->rl_conf.ssl_key_len;
-		}
-		if (rlay->rl_conf.ssl_ca_len) {
+			iov[c++].iov_len = rl.ssl_key_len;
+		} else
+			rl.ssl_key_len = 0;
+		if (rl.ssl_ca_len) {
 			iov[c].iov_base = rlay->rl_ssl_ca;
-			iov[c++].iov_len = rlay->rl_conf.ssl_ca_len;
+			iov[c++].iov_len = rl.ssl_ca_len;
 		}
-		if (rlay->rl_conf.ssl_cacert_len) {
+		if (rl.ssl_cacert_len) {
 			iov[c].iov_base = rlay->rl_ssl_cacert;
-			iov[c++].iov_len = rlay->rl_conf.ssl_cacert_len;
+			iov[c++].iov_len = rl.ssl_cacert_len;
 		}
-		if (rlay->rl_conf.ssl_cakey_len) {
+		if ((what & CONFIG_CA_ENGINE) == 0 &&
+		    rl.ssl_cakey_len) {
 			iov[c].iov_base = rlay->rl_ssl_cakey;
-			iov[c++].iov_len = rlay->rl_conf.ssl_cakey_len;
-		}
+			iov[c++].iov_len = rl.ssl_cakey_len;
+		} else
+			rl.ssl_cakey_len = 0;
 
 		if (id == PROC_RELAY) {
 			/* XXX imsg code will close the fd after 1st call */
@@ -857,6 +858,9 @@ config_setrelay(struct relayd *env, struct relay *rlay)
 			proc_composev_imsg(ps, id, -1, IMSG_CFG_RELAY, -1,
 			    iov, c);
 		}
+
+		if ((what & CONFIG_TABLES) == 0)
+			continue;
 
 		/* Now send the tables associated to this relay */
 		TAILQ_FOREACH(rlt, &rlay->rl_tables, rlt_entry) {

@@ -1,7 +1,7 @@
-/*	$OpenBSD: relay_udp.c,v 1.28 2013/03/10 23:32:53 reyk Exp $	*/
+/*	$OpenBSD: relay_udp.c,v 1.31 2014/07/13 00:32:08 benno Exp $	*/
 
 /*
- * Copyright (c) 2007, 2008 Reyk Floeter <reyk@openbsd.org>
+ * Copyright (c) 2007 - 2013 Reyk Floeter <reyk@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -52,7 +52,7 @@ extern objid_t relay_conid;
 extern int proc_id;
 extern int debug;
 
-struct relayd *env = NULL;
+static struct relayd *env = NULL;
 struct shuffle relay_shuffle;
 
 int		 relay_udp_socket(struct sockaddr_storage *, in_port_t,
@@ -249,8 +249,6 @@ relay_udp_server(int fd, short sig, void *arg)
 	con->se_out.con = con;
 	con->se_relay = rlay;
 	con->se_id = ++relay_conid;
-	con->se_in.tree = &proto->request_tree;
-	con->se_out.tree = &proto->response_tree;
 	con->se_in.dir = RELAY_DIR_REQUEST;
 	con->se_out.dir = RELAY_DIR_RESPONSE;
 	con->se_retry = rlay->rl_conf.dstretry;
@@ -282,6 +280,7 @@ relay_udp_server(int fd, short sig, void *arg)
 	}
 
 	/* Pre-allocate log buffer */
+	con->se_haslog = 0;
 	con->se_log = evbuffer_new();
 	if (con->se_log == NULL) {
 		relay_close(con, "failed to allocate log buffer");
