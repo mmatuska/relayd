@@ -11,25 +11,25 @@ SRCS=	imsg-buffer.c \
 
 .PATH:	${.CURDIR}
 SRCS+=	parse.y \
-	log.c \
+	ca.c \
+	check_icmp.c \
+	check_script.c \
+	check_tcp.c \
+	config.c \
 	control.c \
-	ssl.c \
-	ssl_privsep.c \
-	relayd.c \
+	hce.c \
+	log.c \
+	name2id.c \
 	pfe.c \
 	pfe_filter.c \
-	hce.c \
+	proc.c \
 	relay.c \
 	relay_http.c \
 	relay_udp.c \
-	check_icmp.c \
-	check_tcp.c \
-	check_script.c \
-	name2id.c \
-	arc4random.c \
+	relayd.c \
 	shuffle.c \
-	proc.c \
-	config.c
+	ssl.c \
+	ssl_privsep.c
 
 .PATH:	${.CURDIR}/../../../libevent
 SRCS+=	buffer.c \

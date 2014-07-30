@@ -1,4 +1,4 @@
-/*	$OpenBSD: pfe.c,v 1.74 2013/03/10 23:32:53 reyk Exp $	*/
+/*	$OpenBSD: pfe.c,v 1.75 2014/07/09 16:42:05 reyk Exp $	*/
 
 /*
  * Copyright (c) 2006 Pierre-Yves Ritschard <pyr@openbsd.org>
@@ -198,8 +198,6 @@ pfe_dispatch_parent(int fd, struct privsep_proc *p, struct imsg *imsg)
 #endif
 	case IMSG_CFG_PROTO:
 		config_getproto(env, imsg);
-		break;
-	case IMSG_CFG_PROTONODE:
 		break;
 	case IMSG_CFG_RELAY:
 		config_getrelay(env, imsg);

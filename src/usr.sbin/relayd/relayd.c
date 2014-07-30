@@ -1,7 +1,7 @@
-/*	$OpenBSD: relayd.c,v 1.117 2013/05/30 20:17:12 reyk Exp $	*/
+/*	$OpenBSD: relayd.c,v 1.130 2014/07/13 00:32:08 benno Exp $	*/
 
 /*
- * Copyright (c) 2007, 2008 Reyk Floeter <reyk@openbsd.org>
+ * Copyright (c) 2007 - 2014 Reyk Floeter <reyk@openbsd.org>
  * Copyright (c) 2006 Pierre-Yves Ritschard <pyr@openbsd.org>
  *
  * Permission to use, copy, modify, and distribute this software for any
@@ -38,6 +38,7 @@
 #include <stdlib.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <fnmatch.h>
 #include <err.h>
 #include <errno.h>
 #include <event.h>
@@ -66,6 +67,8 @@ int		 parent_dispatch_pfe(int, struct privsep_proc *, struct imsg *);
 int		 parent_dispatch_hce(int, struct privsep_proc *, struct imsg *);
 int		 parent_dispatch_relay(int, struct privsep_proc *,
 		    struct imsg *);
+int		 parent_dispatch_ca(int, struct privsep_proc *,
+		    struct imsg *);
 int		 bindany(struct ctl_bindany *);
 
 struct relayd			*relayd_env;
@@ -73,7 +76,8 @@ struct relayd			*relayd_env;
 static struct privsep_proc procs[] = {
 	{ "pfe",	PROC_PFE, parent_dispatch_pfe, pfe },
 	{ "hce",	PROC_HCE, parent_dispatch_hce, hce },
-	{ "relay",	PROC_RELAY, parent_dispatch_relay, relay }
+	{ "relay",	PROC_RELAY, parent_dispatch_relay, relay },
+	{ "ca",		PROC_CA, parent_dispatch_ca, ca }
 };
 
 void
@@ -142,7 +146,6 @@ parent_sig_handler(int sig, short event, void *arg)
 	}
 }
 
-/* __dead is for lint */
 __dead void
 usage(void)
 {
@@ -207,6 +210,7 @@ main(int argc, char *argv[])
 	relayd_env = env;
 	env->sc_ps = ps;
 	ps->ps_env = env;
+	TAILQ_INIT(&ps->ps_rcsocks);
 	env->sc_conffile = conffile;
 	env->sc_opts = opts;
 
@@ -247,6 +251,9 @@ main(int argc, char *argv[])
 #endif
 
 	ps->ps_instances[PROC_RELAY] = env->sc_prefork_relay;
+	ps->ps_instances[PROC_CA] = env->sc_prefork_relay;
+	ps->ps_ninstances = env->sc_prefork_relay;
+
 	proc_init(ps, procs, nitems(procs));
 
 	setproctitle("parent");
@@ -265,7 +272,7 @@ main(int argc, char *argv[])
 	signal_add(&ps->ps_evsighup, NULL);
 	signal_add(&ps->ps_evsigpipe, NULL);
 
-	proc_config(ps, procs, nitems(procs));
+	proc_listen(ps, procs, nitems(procs));
 
 	if (load_config(env->sc_conffile, env) == -1) {
 		proc_kill(env->sc_ps);
@@ -320,6 +327,8 @@ parent_configure(struct relayd *env)
 #endif
 	TAILQ_FOREACH(proto, env->sc_protos, entry)
 		config_setproto(env, proto);
+	TAILQ_FOREACH(proto, env->sc_protos, entry)
+		config_setrule(env, proto);
 	TAILQ_FOREACH(rlay, env->sc_relays, rl_entry) {
 		/* Check for SSL Inspection */
 		if ((rlay->rl_conf.flags & (F_SSL|F_SSLCLIENT)) ==
@@ -331,8 +340,8 @@ parent_configure(struct relayd *env)
 		config_setrelay(env, rlay);
 	}
 
-	/* HCE, PFE and the preforked relays need to reload their config. */
-	env->sc_reload = 2 + env->sc_prefork_relay;
+	/* HCE, PFE, CA and the relays need to reload their config. */
+	env->sc_reload = 2 + (2 * env->sc_prefork_relay);
 
 	for (id = 0; id < PROC_MAX; id++) {
 		if (id == privsep_process)
@@ -357,7 +366,7 @@ parent_configure(struct relayd *env)
 	ret = 0;
 
  done:
-	config_purge(env, CONFIG_ALL);
+	config_purge(env, CONFIG_ALL & ~CONFIG_RELAYS);
 	return (ret);
 }
 
@@ -552,31 +561,20 @@ parent_dispatch_relay(int fd, struct privsep_proc *p, struct imsg *imsg)
 	return (0);
 }
 
-void
-purge_tree(struct proto_tree *tree)
+int
+parent_dispatch_ca(int fd, struct privsep_proc *p, struct imsg *imsg)
 {
-	struct protonode	*proot, *pn;
+	struct relayd		*env = p->p_env;
 
-	while ((proot = RB_ROOT(tree)) != NULL) {
-		RB_REMOVE(proto_tree, tree, proot);
-		if (proot->key != NULL)
-			free(proot->key);
-		if (proot->value != NULL)
-			free(proot->value);
-		while ((pn = SIMPLEQ_FIRST(&proot->head)) != NULL) {
-			SIMPLEQ_REMOVE_HEAD(&proot->head, entry);
-			if (pn->key != NULL)
-				free(pn->key);
-			if (pn->value != NULL)
-				free(pn->value);
-			if (pn->labelname != NULL)
-				free(pn->labelname);
-			if (pn->label != 0)
-				pn_unref(pn->label);
-			free(pn);
-		}
-		free(proot);
+	switch (imsg->hdr.type) {
+	case IMSG_CFG_DONE:
+		parent_configure_done(env);
+		break;
+	default:
+		return (-1);
 	}
+
+	return (0);
 }
 
 void
@@ -607,6 +605,24 @@ purge_table(struct tablelist *head, struct table *table)
 }
 
 void
+purge_key(char **ptr, off_t len)
+{
+	char	*key = *ptr;
+
+	if (key == NULL || len == 0)
+		return;
+
+#ifndef __FreeBSD__
+	explicit_bzero(key, len);
+#else
+	bzero(key, len);
+#endif
+	free(key);
+
+	*ptr = NULL;
+}
+
+void
 purge_relay(struct relayd *env, struct relay *rlay)
 {
 	struct rsession		*con;
@@ -629,14 +645,30 @@ purge_relay(struct relayd *env, struct relay *rlay)
 	if (rlay->rl_dstbev != NULL)
 		bufferevent_free(rlay->rl_dstbev);
 
+	purge_key(&rlay->rl_ssl_cert, rlay->rl_conf.ssl_cert_len);
+	purge_key(&rlay->rl_ssl_key, rlay->rl_conf.ssl_key_len);
+	purge_key(&rlay->rl_ssl_ca, rlay->rl_conf.ssl_ca_len);
+	purge_key(&rlay->rl_ssl_cakey, rlay->rl_conf.ssl_cakey_len);
+
+	if (rlay->rl_ssl_x509 != NULL) {
+		X509_free(rlay->rl_ssl_x509);
+		rlay->rl_ssl_x509 = NULL;
+	}
+	if (rlay->rl_ssl_pkey != NULL) {
+		EVP_PKEY_free(rlay->rl_ssl_pkey);
+		rlay->rl_ssl_pkey = NULL;
+	}
+	if (rlay->rl_ssl_cacertx509 != NULL) {
+		X509_free(rlay->rl_ssl_cacertx509);
+		rlay->rl_ssl_cacertx509 = NULL;
+	}
+	if (rlay->rl_ssl_capkey != NULL) {
+		EVP_PKEY_free(rlay->rl_ssl_capkey);
+		rlay->rl_ssl_capkey = NULL;
+	}
+
 	if (rlay->rl_ssl_ctx != NULL)
 		SSL_CTX_free(rlay->rl_ssl_ctx);
-	if (rlay->rl_ssl_cert != NULL)
-		free(rlay->rl_ssl_cert);
-	if (rlay->rl_ssl_key != NULL)
-		free(rlay->rl_ssl_key);
-	if (rlay->rl_ssl_ca != NULL)
-		free(rlay->rl_ssl_ca);
 
 	while ((rlt = TAILQ_FIRST(&rlay->rl_tables))) {
 		TAILQ_REMOVE(&rlay->rl_tables, rlt, rlt_entry);
@@ -644,6 +676,390 @@ purge_relay(struct relayd *env, struct relay *rlay)
 	}
 
 	free(rlay);
+}
+
+
+struct kv *
+kv_add(struct kvtree *keys, char *key, char *value)
+{
+	struct kv	*kv, *oldkv;
+
+	if (key == NULL)
+		return (NULL);
+	if ((kv = calloc(1, sizeof(*kv))) == NULL)
+		return (NULL);
+	if ((kv->kv_key = strdup(key)) == NULL) {
+		free(kv);
+		return (NULL);
+	}
+	if (value != NULL &&
+	    (kv->kv_value = strdup(value)) == NULL) {
+		free(kv->kv_key);
+		free(kv);
+		return (NULL);
+	}
+	TAILQ_INIT(&kv->kv_children);
+
+	if ((oldkv = RB_INSERT(kvtree, keys, kv)) != NULL) {
+		TAILQ_INSERT_TAIL(&oldkv->kv_children, kv, kv_entry);
+		kv->kv_parent = oldkv;
+	}
+
+	return (kv);
+}
+
+int
+kv_set(struct kv *kv, char *fmt, ...)
+{
+	va_list		  ap;
+	char		*value = NULL;
+	struct kv	*ckv;
+
+	va_start(ap, fmt);
+	if (vasprintf(&value, fmt, ap) == -1)
+		return (-1);
+	va_end(ap);
+
+	/* Remove all children */
+	while ((ckv = TAILQ_FIRST(&kv->kv_children)) != NULL) {
+		TAILQ_REMOVE(&kv->kv_children, ckv, kv_entry);
+		kv_free(ckv);
+		free(ckv);
+	}
+
+	/* Set the new value */
+	if (kv->kv_value != NULL)
+		free(kv->kv_value);
+	kv->kv_value = value;
+
+	return (0);
+}
+
+int
+kv_setkey(struct kv *kv, char *fmt, ...)
+{
+	va_list  ap;
+	char	*key = NULL;
+
+	va_start(ap, fmt);
+	if (vasprintf(&key, fmt, ap) == -1)
+		return (-1);
+	va_end(ap);
+
+	if (kv->kv_key != NULL)
+		free(kv->kv_key);
+	kv->kv_key = key;
+
+	return (0);
+}
+
+void
+kv_delete(struct kvtree *keys, struct kv *kv)
+{
+	struct kv	*ckv;
+
+	RB_REMOVE(kvtree, keys, kv);
+
+	/* Remove all children */
+	while ((ckv = TAILQ_FIRST(&kv->kv_children)) != NULL) {
+		TAILQ_REMOVE(&kv->kv_children, ckv, kv_entry);
+		kv_free(ckv);
+		free(ckv);
+	}
+
+	kv_free(kv);
+	free(kv);
+}
+
+struct kv *
+kv_extend(struct kvtree *keys, struct kv *kv, char *value)
+{
+	char		*newvalue;
+
+	if (kv == NULL) {
+		return (NULL);
+	} else if (kv->kv_value != NULL) {
+		if (asprintf(&newvalue, "%s%s", kv->kv_value, value) == -1)
+			return (NULL);
+
+		free(kv->kv_value);
+		kv->kv_value = newvalue;
+	} else if ((kv->kv_value = strdup(value)) == NULL)
+		return (NULL);
+
+	return (kv);
+}
+
+void
+kv_purge(struct kvtree *keys)
+{
+	struct kv	*kv;
+
+	while ((kv = RB_MIN(kvtree, keys)) != NULL)
+		kv_delete(keys, kv);
+}
+
+void
+kv_free(struct kv *kv)
+{
+	if (kv->kv_type == KEY_TYPE_NONE)
+		return;
+	if (kv->kv_key != NULL) {
+		free(kv->kv_key);
+	}
+	kv->kv_key = NULL;
+	if (kv->kv_value != NULL) {
+		free(kv->kv_value);
+	}
+	kv->kv_value = NULL;
+	kv->kv_matchtree = NULL;
+	kv->kv_match = NULL;
+	memset(kv, 0, sizeof(*kv));
+}
+
+struct kv *
+kv_inherit(struct kv *dst, struct kv *src)
+{
+	memset(dst, 0, sizeof(*dst));
+	memcpy(dst, src, sizeof(*dst));
+	TAILQ_INIT(&dst->kv_children);
+
+	if (src->kv_key != NULL) {
+		if ((dst->kv_key = strdup(src->kv_key)) == NULL) {
+			kv_free(dst);
+			return (NULL);
+		}
+	}
+	if (src->kv_value != NULL) {
+		if ((dst->kv_value = strdup(src->kv_value)) == NULL) {
+			kv_free(dst);
+			return (NULL);
+		}
+	}
+
+	if (src->kv_match != NULL)
+		dst->kv_match = src->kv_match;
+	if (src->kv_matchtree != NULL)
+		dst->kv_matchtree = src->kv_matchtree;
+
+	return (dst);
+}
+
+int
+kv_log(struct rsession *con, struct kv *kv, u_int16_t labelid,
+    enum direction dir)
+{
+	char	*msg;
+
+	if (con->se_log == NULL)
+		return (0);
+	if (asprintf(&msg, " %s%s%s%s%s%s%s",
+	    dir == RELAY_DIR_REQUEST ? "[" : "{",
+	    labelid == 0 ? "" : label_id2name(labelid),
+	    labelid == 0 ? "" : ", ",
+	    kv->kv_key == NULL ? "(unknown)" : kv->kv_key,
+	    kv->kv_value == NULL ? "" : ": ",
+	    kv->kv_value == NULL ? "" : kv->kv_value,
+	    dir == RELAY_DIR_REQUEST ? "]" : "}") == -1)
+		return (-1);
+	if (evbuffer_add(con->se_log, msg, strlen(msg)) == -1) {
+		free(msg);
+		return (-1);
+	}
+	free(msg);
+	con->se_haslog = 1;
+	return (0);
+}
+
+struct kv *
+kv_find(struct kvtree *keys, struct kv *kv)
+{
+	struct kv	*match;
+	const char	*key;
+
+	if (kv->kv_flags & KV_FLAG_GLOBBING) {
+		/* Test header key using shell globbing rules */
+		key = kv->kv_key == NULL ? "" : kv->kv_key;
+		RB_FOREACH(match, kvtree, keys) {
+			if (fnmatch(key, match->kv_key, FNM_CASEFOLD) == 0)
+				break;
+		}
+	} else {
+		/* Fast tree-based lookup only works without globbing */
+		match = RB_FIND(kvtree, keys, kv);
+	}
+
+	return (match);
+}
+
+int
+kv_cmp(struct kv *a, struct kv *b)
+{
+	return (strcasecmp(a->kv_key, b->kv_key));
+}
+
+RB_GENERATE(kvtree, kv, kv_node, kv_cmp);
+
+int
+rule_add(struct protocol *proto, struct relay_rule *rule, const char *rulefile)
+{
+	struct relay_rule	*r = NULL;
+	struct kv		*kv = NULL;
+	FILE			*fp = NULL;
+	char			 buf[BUFSIZ];
+	int			 ret = -1;
+	u_int			 i;
+
+	for (i = 0; i < KEY_TYPE_MAX; i++) {
+		kv = &rule->rule_kv[i];
+		if (kv->kv_type != i)
+			continue;
+
+		switch (kv->kv_option) {
+		case KEY_OPTION_LOG:
+			/* log action needs a key or a file to be specified */
+			if (kv->kv_key == NULL && rulefile == NULL &&
+			    (kv->kv_key = strdup("*")) == NULL)
+				goto fail;
+			break;
+		default:
+			break;
+		}
+
+		switch (kv->kv_type) {
+		case KEY_TYPE_QUERY:
+		case KEY_TYPE_PATH:
+		case KEY_TYPE_URL:
+			if (rule->rule_dir != RELAY_DIR_REQUEST)
+				goto fail;
+			break;
+		default:
+			break;
+		}
+
+		if (kv->kv_value != NULL && strchr(kv->kv_value, '$') != NULL)
+			kv->kv_flags |= KV_FLAG_MACRO;
+		if (kv->kv_key != NULL && strpbrk(kv->kv_key, "*?[") != NULL)
+			kv->kv_flags |= KV_FLAG_GLOBBING;
+	}
+
+	if (rulefile == NULL) {
+		TAILQ_INSERT_TAIL(&proto->rules, rule, rule_entry);
+		return (0);
+	}
+
+	if ((fp = fopen(rulefile, "r")) == NULL)
+		goto fail;
+
+	while (fgets(buf, sizeof(buf), fp) != NULL) {
+		/* strip whitespace and newline characters */
+		buf[strcspn(buf, "\r\n\t ")] = '\0';
+		if (!strlen(buf) || buf[0] == '#')
+			continue;
+
+		if ((r = rule_inherit(rule)) == NULL)
+			goto fail;
+
+		for (i = 0; i < KEY_TYPE_MAX; i++) {
+			kv = &r->rule_kv[i];
+			if (kv->kv_type != i)
+				continue;
+			if (kv->kv_key != NULL)
+				free(kv->kv_key);
+			if ((kv->kv_key = strdup(buf)) == NULL) {
+				rule_free(r);
+				free(r);
+				goto fail;
+			}
+		}
+
+		TAILQ_INSERT_TAIL(&proto->rules, r, rule_entry);
+	}
+
+	ret = 0;
+	rule_free(rule);
+	free(rule);
+
+ fail:
+	if (fp != NULL)
+		fclose(fp);
+	return (ret);
+}
+
+struct relay_rule *
+rule_inherit(struct relay_rule *rule)
+{
+	struct relay_rule	*r;
+	u_int			 i;
+	struct kv		*kv;
+
+	if ((r = calloc(1, sizeof(*r))) == NULL)
+		return (NULL);
+	memcpy(r, rule, sizeof(*r));
+
+	for (i = 0; i < KEY_TYPE_MAX; i++) {
+		kv = &rule->rule_kv[i];
+		if (kv->kv_type != i)
+			continue;
+		if (kv_inherit(&r->rule_kv[i], kv) == NULL) {
+			free(r);
+			return(NULL);
+		}
+	}
+
+	if (r->rule_label > 0)
+		label_ref(r->rule_label);
+	if (r->rule_tag > 0)
+		tag_ref(r->rule_tag);
+	if (r->rule_tagged > 0)
+		tag_ref(r->rule_tagged);
+
+	return (r);
+}
+
+void
+rule_free(struct relay_rule *rule)
+{
+	u_int	i;
+
+	for (i = 0; i < KEY_TYPE_MAX; i++)
+		kv_free(&rule->rule_kv[i]);
+	if (rule->rule_label > 0)
+		label_unref(rule->rule_label);
+	if (rule->rule_tag > 0)
+		tag_unref(rule->rule_tag);
+	if (rule->rule_tagged > 0)
+		tag_unref(rule->rule_tagged);
+}
+
+void
+rule_delete(struct relay_rules *rules, struct relay_rule *rule)
+{
+	TAILQ_REMOVE(rules, rule, rule_entry);
+	rule_free(rule);
+	free(rule);
+}
+
+void
+rule_settable(struct relay_rules *rules, struct relay_table *rlt)
+{
+	struct relay_rule	*r;
+	char		 	 pname[TABLE_NAME_SIZE];
+
+	if (rlt->rlt_table == NULL || strlcpy(pname, rlt->rlt_table->conf.name,
+	    sizeof(pname)) >= sizeof(pname))
+		return;
+
+	pname[strcspn(pname, ":")] = '\0';
+
+	TAILQ_FOREACH(r, rules, rule_entry) {
+		if (r->rule_tablename[0] &&
+		    strcmp(pname, r->rule_tablename) == 0) {
+			r->rule_table = rlt;
+		} else {
+			r->rule_table = NULL;
+		}
+	}
 }
 
 /*
@@ -830,6 +1246,36 @@ relay_findbyaddr(struct relayd *env, struct relay_config *rc)
 	return (NULL);
 }
 
+EVP_PKEY *
+pkey_find(struct relayd *env, objid_t id)
+{
+	struct ca_pkey	*pkey;
+
+	TAILQ_FOREACH(pkey, env->sc_pkeys, pkey_entry)
+		if (pkey->pkey_id == id)
+			return (pkey->pkey);
+	return (NULL);
+}
+
+struct ca_pkey *
+pkey_add(struct relayd *env, EVP_PKEY *pkey, objid_t id)
+{
+	struct ca_pkey	*ca_pkey;
+
+	if (env->sc_pkeys == NULL)
+		fatalx("pkeys");
+
+	if ((ca_pkey = calloc(1, sizeof(*ca_pkey))) == NULL)
+		return (NULL);
+
+	ca_pkey->pkey = pkey;
+	ca_pkey->pkey_id = id;
+
+	TAILQ_INSERT_TAIL(env->sc_pkeys, ca_pkey, pkey_entry);
+
+	return (ca_pkey);
+}
+
 void
 event_again(struct event *ev, int fd, short event,
     void (*fn)(int, short, void *),
@@ -985,168 +1431,6 @@ canonicalize_host(const char *host, char *name, size_t len)
 	return (NULL);
 }
 
-struct protonode *
-protonode_header(enum direction dir, struct protocol *proto,
-    struct protonode *pk)
-{
-	struct protonode	*pn;
-	struct proto_tree	*tree;
-
-	if (dir == RELAY_DIR_RESPONSE)
-		tree = &proto->response_tree;
-	else
-		tree = &proto->request_tree;
-
-	pn = RB_FIND(proto_tree, tree, pk);
-	if (pn != NULL)
-		return (pn);
-	if ((pn = calloc(1, sizeof(*pn))) == NULL) {
-		log_warn("%s: calloc", __func__);
-		return (NULL);
-	}
-	pn->key = strdup(pk->key);
-	if (pn->key == NULL) {
-		free(pn);
-		log_warn("%s: strdup", __func__);
-		return (NULL);
-	}
-	pn->value = NULL;
-	pn->action = NODE_ACTION_NONE;
-	pn->type = pk->type;
-	SIMPLEQ_INIT(&pn->head);
-	if (dir == RELAY_DIR_RESPONSE)
-		pn->id =
-		    proto->response_nodes++;
-	else
-		pn->id = proto->request_nodes++;
-	if (pn->id == INT_MAX) {
-		log_warnx("%s: too many protocol "
-		    "nodes defined", __func__);
-		return (NULL);
-	}
-	RB_INSERT(proto_tree, tree, pn);
-	return (pn);
-}
-
-int
-protonode_add(enum direction dir, struct protocol *proto,
-    struct protonode *node)
-{
-	struct protonode	*pn, *proot, pk;
-	struct proto_tree	*tree;
-
-	if (dir == RELAY_DIR_RESPONSE)
-		tree = &proto->response_tree;
-	else
-		tree = &proto->request_tree;
-
-	if ((pn = calloc(1, sizeof (*pn))) == NULL) {
-		log_warn("%s: calloc", __func__);
-		return (-1);
-	}
-	bcopy(node, pn, sizeof(*pn));
-	pn->key = node->key;
-	pn->value = node->value;
-	pn->labelname = NULL;
-	if (node->labelname != NULL)
-		pn->label = pn_name2id(node->labelname);
-	SIMPLEQ_INIT(&pn->head);
-	if (dir == RELAY_DIR_RESPONSE)
-		pn->id = proto->response_nodes++;
-	else
-		pn->id = proto->request_nodes++;
-	if (pn->id == INT_MAX) {
-		log_warnx("%s: too many protocol nodes defined", __func__);
-		free(pn);
-		return (-1);
-	}
-	if ((proot =
-	    RB_INSERT(proto_tree, tree, pn)) != NULL) {
-		/*
-		 * A protocol node with the same key already
-		 * exists, append it to a queue behind the
-		 * existing node->
-		 */
-		if (SIMPLEQ_EMPTY(&proot->head))
-			SIMPLEQ_NEXT(proot, entry) = pn;
-		SIMPLEQ_INSERT_TAIL(&proot->head, pn, entry);
-	}
-	if (node->type == NODE_TYPE_COOKIE)
-		pk.key = "Cookie";
-	else if (node->type == NODE_TYPE_URL)
-		pk.key = "Host";
-	else
-		pk.key = "GET";
-	if (node->type != NODE_TYPE_HEADER) {
-		pk.type = NODE_TYPE_HEADER;
-		pn = protonode_header(dir, proto, &pk);
-		if (pn == NULL)
-			return (-1);
-		switch (node->type) {
-		case NODE_TYPE_QUERY:
-			pn->flags |= PNFLAG_LOOKUP_QUERY;
-			break;
-		case NODE_TYPE_COOKIE:
-			pn->flags |= PNFLAG_LOOKUP_COOKIE;
-			break;
-		case NODE_TYPE_URL:
-			if (node->flags &
-			    PNFLAG_LOOKUP_URL_DIGEST)
-				pn->flags |= node->flags &
-				    PNFLAG_LOOKUP_URL_DIGEST;
-			else
-				pn->flags |=
-				    PNFLAG_LOOKUP_DIGEST(0);
-			break;
-		default:
-			break;
-		}
-	}
-
-	return (0);
-}
-
-int
-protonode_load(enum direction dir, struct protocol *proto,
-    struct protonode *node, const char *name)
-{
-	FILE			*fp;
-	char			 buf[BUFSIZ];
-	int			 ret = -1;
-	struct protonode	 pn;
-
-	bcopy(node, &pn, sizeof(pn));
-	pn.key = pn.value = NULL;
-
-	if ((fp = fopen(name, "r")) == NULL)
-		return (-1);
-
-	while (fgets(buf, sizeof(buf), fp) != NULL) {
-		/* strip whitespace and newline characters */
-		buf[strcspn(buf, "\r\n\t ")] = '\0';
-		if (!strlen(buf) || buf[0] == '#')
-			continue;
-		pn.key = strdup(buf);
-		if (node->value != NULL)
-			pn.value = strdup(node->value);
-		if (pn.key == NULL ||
-		    (node->value != NULL && pn.value == NULL))
-			goto fail;
-		if (protonode_add(dir, proto, &pn) == -1)
-			goto fail;
-		pn.key = pn.value = NULL;
-	}
-
-	ret = 0;
- fail:
-	if (pn.key != NULL)
-		free(pn.key);
-	if (pn.value != NULL)
-		free(pn.value);
-	fclose(fp);
-	return (ret);
-}
-
 int
 bindany(struct ctl_bindany *bnd)
 {
@@ -1268,7 +1552,7 @@ get_string(u_int8_t *ptr, size_t len)
 	char	*str;
 
 	for (i = 0; i < len; i++)
-		if (!(isprint((char)ptr[i]) || isspace((char)ptr[i])))
+		if (!(isprint(ptr[i]) || isspace(ptr[i])))
 			break;
 
 	if ((str = calloc(1, i + 1)) == NULL)
@@ -1290,6 +1574,102 @@ get_data(u_int8_t *ptr, size_t len)
 	return (data);
 }
 
+int
+sockaddr_cmp(struct sockaddr *a, struct sockaddr *b, int prefixlen)
+{
+	struct sockaddr_in	*a4, *b4;
+	struct sockaddr_in6	*a6, *b6;
+	u_int32_t		 av[4], bv[4], mv[4];
+
+	if (a->sa_family == AF_UNSPEC || b->sa_family == AF_UNSPEC)
+		return (0);
+	else if (a->sa_family > b->sa_family)
+		return (1);
+	else if (a->sa_family < b->sa_family)
+		return (-1);
+
+	if (prefixlen == -1)
+		memset(&mv, 0xff, sizeof(mv));
+
+	switch (a->sa_family) {
+	case AF_INET:
+		a4 = (struct sockaddr_in *)a;
+		b4 = (struct sockaddr_in *)b;
+
+		av[0] = a4->sin_addr.s_addr;
+		bv[0] = b4->sin_addr.s_addr;
+		if (prefixlen != -1)
+			mv[0] = prefixlen2mask(prefixlen);
+
+		if ((av[0] & mv[0]) > (bv[0] & mv[0]))
+			return (1);
+		if ((av[0] & mv[0]) < (bv[0] & mv[0]))
+			return (-1);
+		break;
+	case AF_INET6:
+		a6 = (struct sockaddr_in6 *)a;
+		b6 = (struct sockaddr_in6 *)b;
+
+		memcpy(&av, &a6->sin6_addr.s6_addr, 16);
+		memcpy(&bv, &b6->sin6_addr.s6_addr, 16);
+		if (prefixlen != -1)
+			prefixlen2mask6(prefixlen, mv);
+
+		if ((av[3] & mv[3]) > (bv[3] & mv[3]))
+			return (1);
+		if ((av[3] & mv[3]) < (bv[3] & mv[3]))
+			return (-1);
+		if ((av[2] & mv[2]) > (bv[2] & mv[2]))
+			return (1);
+		if ((av[2] & mv[2]) < (bv[2] & mv[2]))
+			return (-1);
+		if ((av[1] & mv[1]) > (bv[1] & mv[1]))
+			return (1);
+		if ((av[1] & mv[1]) < (bv[1] & mv[1]))
+			return (-1);
+		if ((av[0] & mv[0]) > (bv[0] & mv[0]))
+			return (1);
+		if ((av[0] & mv[0]) < (bv[0] & mv[0]))
+			return (-1);
+		break;
+	}
+
+	return (0);
+}
+
+u_int32_t
+prefixlen2mask(u_int8_t prefixlen)
+{
+	if (prefixlen == 0)
+		return (0);
+
+	if (prefixlen > 32)
+		prefixlen = 32;
+
+	return (htonl(0xffffffff << (32 - prefixlen)));
+}
+
+struct in6_addr *
+prefixlen2mask6(u_int8_t prefixlen, u_int32_t *mask)
+{
+	static struct in6_addr  s6;
+	int			i;
+
+	if (prefixlen > 128)
+		prefixlen = 128;
+
+	bzero(&s6, sizeof(s6));
+	for (i = 0; i < prefixlen / 8; i++)
+		s6.s6_addr[i] = 0xff;
+	i = prefixlen % 8;
+	if (i)
+		s6.s6_addr[prefixlen / 8] = 0xff00 >> i;
+
+	memcpy(mask, &s6, sizeof(s6));
+
+	return (&s6);
+}
+
 #ifndef __FreeBSD__ /* file descriptor accounting */
 int
 accept_reserve(int sockfd, struct sockaddr *addr, socklen_t *addrlen,
@@ -1299,14 +1679,13 @@ accept_reserve(int sockfd, struct sockaddr *addr, socklen_t *addrlen,
 	if (getdtablecount() + reserve +
 	    *counter >= getdtablesize()) {
 		errno = EMFILE;
-		return -1;
+		return (-1);
 	}
 
 	if ((ret = accept(sockfd, addr, addrlen)) > -1) {
 		(*counter)++;
-		DPRINTF("%s: inflight incremented, now %d",__func__,
-		    *counter);
+		DPRINTF("%s: inflight incremented, now %d",__func__, *counter);
 	}
-	return ret;
+	return (ret);
 }
 #endif
