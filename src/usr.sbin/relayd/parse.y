@@ -375,32 +375,24 @@ sendbuf		: NOTHING		{
 		;
 
 main		: INTERVAL NUMBER	{
-			if (loadcfg)
-				break;
 			if ((conf->sc_interval.tv_sec = $2) < 0) {
 				yyerror("invalid interval: %d", $2);
 				YYERROR;
 			}
 		}
 		| LOG loglevel		{
-			if (loadcfg)
-				break;
 			conf->sc_opts |= $2;
 		}
 		| TIMEOUT timeout	{
-			if (loadcfg)
-				break;
 			bcopy(&$2, &conf->sc_timeout, sizeof(struct timeval));
 		}
 		| PREFORK NUMBER	{
-			if (loadcfg)
-				break;
 			if ($2 <= 0 || $2 > RELAY_MAXPROC) {
 				yyerror("invalid number of preforked "
 				    "relays: %d", $2);
 				YYERROR;
 			}
-			conf->sc_prefork_relay = $2;
+			conf->sc_prefork_relay = (short)$2;
 		}
 /* FreeBSD exclude
 		| SNMP trap optstring	{
