@@ -250,6 +250,10 @@ main(int argc, char *argv[])
 #endif
 #endif
 
+	if (load_config(env->sc_conffile, env) == -1) {
+		proc_kill(env->sc_ps);
+		exit(1);
+	}
 	ps->ps_instances[PROC_RELAY] = env->sc_prefork_relay;
 	ps->ps_instances[PROC_CA] = env->sc_prefork_relay;
 	ps->ps_ninstances = env->sc_prefork_relay;
@@ -273,11 +277,6 @@ main(int argc, char *argv[])
 	signal_add(&ps->ps_evsigpipe, NULL);
 
 	proc_listen(ps, procs, nitems(procs));
-
-	if (load_config(env->sc_conffile, env) == -1) {
-		proc_kill(env->sc_ps);
-		exit(1);
-	}
 
 	if (env->sc_opts & RELAYD_OPT_NOACTION) {
 		fprintf(stderr, "configuration OK\n");
