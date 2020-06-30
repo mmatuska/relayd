@@ -937,6 +937,8 @@ Use selective acknowledgements for this connection.
 Set the socket-level buffer size for input and output for this
 connection.
 This will affect the TCP window size.
+.It Ic dontfrag Ar number
+Set socket option IP_DONTFRAG with given value. This is useful for services like DNS which return values in one huge segment.
 .El
 .El
 .Sh FILTER RULES
