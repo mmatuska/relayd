@@ -49,6 +49,8 @@
 
 #include <openssl/dh.h>
 #include <openssl/ssl.h>
+#define 	SSL23_ST_SR_CLNT_HELLO_A   (0x210|SSL_ST_ACCEPT)
+#define 	SSL3_ST_SR_CLNT_HELLO_A   (0x110|SSL_ST_ACCEPT)
 
 #include "relayd.h"
 
@@ -581,6 +583,12 @@ relay_socket(struct sockaddr_storage *ss, in_port_t port,
 		    &val, sizeof(val)) == -1)
 			goto bad;
 	}
+        if (proto->tcpflags & TCPFLAG_DONTFRAG) {
+                val = (int)proto->dontfragsiz;
+                if (setsockopt(s, IPPROTO_IP, IP_DONTFRAG,
+                    &val, sizeof(val)) == -1)
+                        goto bad;
+        }
 
 	/*
 	 * TCP options
@@ -1977,35 +1985,20 @@ DH *
 relay_ssl_get_dhparams(int keylen)
 {
 	DH		*dh;
-	BIGNUM		*(*prime)(BIGNUM *);
-	const char	*gen;
-
-	gen = "2";
-	if (keylen >= 8192)
-		prime = get_rfc3526_prime_8192;
-	else if (keylen >= 4096)
-		prime = get_rfc3526_prime_4096;
-	else if (keylen >= 3072)
-		prime = get_rfc3526_prime_3072;
-	else if (keylen >= 2048)
-		prime = get_rfc3526_prime_2048;
-	else if (keylen >= 1536)
-		prime = get_rfc3526_prime_1536;
-	else
-		prime = get_rfc2409_prime_1024;
+        int codes;
 
 	if ((dh = DH_new()) == NULL)
 		return (NULL);
 
-	dh->p = (*prime)(NULL);
-	BN_dec2bn(&dh->g, gen);
-
-	if (dh->p == NULL || dh->g == NULL) {
-		DH_free(dh);
-		return (NULL);
-	}
-
-	return (dh);
+        if(1 == DH_generate_parameters_ex(dh, 2048, DH_GENERATOR_2, NULL)) {
+            if(1 == DH_check(dh, &codes)) {
+                if(1 == DH_generate_key(dh)) {
+                    return dh;
+                }
+            }
+        }
+        DH_free(dh);
+	return (NULL);
 }
 
 DH *
@@ -2023,7 +2016,7 @@ relay_ssl_callback_dh(SSL *ssl, int export, int keylen)
 
 	/* Get the private key length from the cert */
 	if ((pkey = SSL_get_privatekey(ssl))) {
-		keytype = EVP_PKEY_type(pkey->type);
+		keytype = EVP_PKEY_base_id(pkey);
 		if (keytype == EVP_PKEY_RSA || keytype == EVP_PKEY_DSA)
 			keylen = EVP_PKEY_bits(pkey);
 		else
@@ -2158,7 +2151,7 @@ relay_ssl_transaction(struct rsession *con, struct ctl_relay_event *cre)
 	struct relay		*rlay = con->se_relay;
 	struct protocol	*proto = rlay->rl_proto;
 	SSL			*ssl;
-	SSL_METHOD		*method;
+	const SSL_METHOD		*method;
 	void			(*cb)(int, short, void *);
 	u_int			 flag;
 
@@ -2168,7 +2161,7 @@ relay_ssl_transaction(struct rsession *con, struct ctl_relay_event *cre)
 
 	if (cre->dir == RELAY_DIR_REQUEST) {
 		cb = relay_ssl_accept;
-		method = SSLv23_server_method();
+		method = TLS_server_method();
 		flag = EV_READ;
 
 		/* Use session-specific certificate for SSL inspection. */
@@ -2176,7 +2169,7 @@ relay_ssl_transaction(struct rsession *con, struct ctl_relay_event *cre)
 			SSL_use_certificate(ssl, cre->sslcert);
 	} else {
 		cb = relay_ssl_connect;
-		method = SSLv23_client_method();
+		method = TLS_client_method();
 		flag = EV_WRITE;
 	}
 

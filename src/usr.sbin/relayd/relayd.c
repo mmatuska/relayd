@@ -45,15 +45,16 @@
 #include <unistd.h>
 #include <ctype.h>
 #include <pwd.h>
-#ifdef __FreeBSD__
-#include <sha.h>
-#else
-#include <sha1.h>
-#endif
 #include <md5.h>
 
 #include <openssl/ssl.h>
 
+#ifdef __FreeBSD__
+ /* #include <sha.h>  */
+ char   *SHA1_Data(const void *, unsigned int, char *);
+#else
+#include <sha1.h>
+#endif
 #include "relayd.h"
 
 __dead void	 usage(void);
@@ -242,7 +243,6 @@ main(int argc, char *argv[])
 
 #ifdef __FreeBSD__
 #if __FreeBSD_version > 800040
-	arc4random_stir();
 	arc4random_buf(rnd, sizeof(rnd));
 	RAND_seed(rnd, sizeof(rnd));
 #else

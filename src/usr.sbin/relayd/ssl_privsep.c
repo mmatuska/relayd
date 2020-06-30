@@ -80,18 +80,19 @@ int	 ssl_ctx_use_certificate_chain(SSL_CTX *, char *, off_t);
 int	 ssl_ctx_load_verify_memory(SSL_CTX *, char *, off_t);
 int	 ssl_by_mem_ctrl(X509_LOOKUP *, int, const char *, long, char **);
 
-X509_LOOKUP_METHOD x509_mem_lookup = {
-	"Load cert from memory",
-	NULL,			/* new */
-	NULL,			/* free */
-	NULL,			/* init */
-	NULL,			/* shutdown */
-	ssl_by_mem_ctrl,	/* ctrl */
-	NULL,			/* get_by_subject */
-	NULL,			/* get_by_issuer_serial */
-	NULL,			/* get_by_fingerprint */
-	NULL,			/* get_by_alias */
-};
+X509_LOOKUP_METHOD *x509_mem_lookup = NULL;
+// {
+// 	"Load cert from memory",
+// 	NULL,			/* new */
+// 	NULL,			/* free */
+// 	NULL,			/* init */
+// 	NULL,			/* shutdown */
+// 	ssl_by_mem_ctrl,	/* ctrl */
+// 	NULL,			/* get_by_subject */
+// 	NULL,			/* get_by_issuer_serial */
+// 	NULL,			/* get_by_fingerprint */
+// 	NULL,			/* get_by_alias */
+// };
 
 #define X509_L_ADD_MEM	3
 
@@ -103,19 +104,22 @@ ssl_ctx_use_certificate_chain(SSL_CTX *ctx, char *buf, off_t len)
 	X509		*x;
 	X509		*ca;
 	unsigned long	 err;
+        pem_password_cb *pwcb;
+        void * pwcbud;
 
 	ret = 0;
 	x = ca = NULL;
 
 	if ((in = BIO_new_mem_buf(buf, len)) == NULL) {
-		SSLerr(SSL_F_SSL_CTX_USE_CERTIFICATE_CHAIN_FILE, ERR_R_BUF_LIB);
+		SSLerr(SSL_F_SSL_CTX_USE_CERTIFICATE_FILE, ERR_R_BUF_LIB);
 		goto end;
 	}
-
+        pwcb = SSL_CTX_get_default_passwd_cb (ctx); 
+        pwcbud = SSL_CTX_get_default_passwd_cb_userdata (ctx); 
 	if ((x = PEM_read_bio_X509(in, NULL,
-	    ctx->default_passwd_callback,
-	    ctx->default_passwd_callback_userdata)) == NULL) {
-		SSLerr(SSL_F_SSL_CTX_USE_CERTIFICATE_CHAIN_FILE, ERR_R_PEM_LIB);
+	    pwcb,
+	    pwcbud)) == NULL) {
+		SSLerr(SSL_F_USE_CERTIFICATE_CHAIN_FILE, ERR_R_PEM_LIB);
 		goto end;
 	}
 
@@ -126,14 +130,11 @@ ssl_ctx_use_certificate_chain(SSL_CTX *ctx, char *buf, off_t len)
 	 * the CA certificates.
 	 */
 
-	if (ctx->extra_certs != NULL) {
-		sk_X509_pop_free(ctx->extra_certs, X509_free);
-		ctx->extra_certs = NULL;
-	}
+        SSL_CTX_clear_extra_chain_certs (ctx);
 
 	while ((ca = PEM_read_bio_X509(in, NULL,
-	    ctx->default_passwd_callback,
-	    ctx->default_passwd_callback_userdata)) != NULL) {
+	    pwcb,
+	    pwcbud)) != NULL) {
 
 		if (!SSL_CTX_add_extra_chain_cert(ctx, ca))
 			goto end;
@@ -162,9 +163,13 @@ ssl_ctx_load_verify_memory(SSL_CTX *ctx, char *buf, off_t len)
 {
 	X509_LOOKUP		*lu;
 	struct iovec		 iov;
+        X509_STORE * store; 
 
-	if ((lu = X509_STORE_add_lookup(ctx->cert_store,
-	    &x509_mem_lookup)) == NULL)
+        x509_mem_lookup=X509_LOOKUP_meth_new ("Load cert from memory");
+        X509_LOOKUP_meth_set_ctrl (x509_mem_lookup, ssl_by_mem_ctrl);
+        store = SSL_CTX_get_cert_store (ctx);
+	if ((lu = X509_STORE_add_lookup(store,
+	    x509_mem_lookup)) == NULL)
 		return (0);
 
 	iov.iov_base = buf;
@@ -186,6 +191,7 @@ ssl_by_mem_ctrl(X509_LOOKUP *lu, int cmd, const char *buf,
 	X509_INFO		*itmp;
 	BIO			*in = NULL;
 	int			 i, count = 0;
+        X509_STORE * store; 
 
 	iov = (const struct iovec *)buf;
 
@@ -198,14 +204,15 @@ ssl_by_mem_ctrl(X509_LOOKUP *lu, int cmd, const char *buf,
 	if ((inf = PEM_X509_INFO_read_bio(in, NULL, NULL, NULL)) == NULL)
 		goto done;
 
+        store = X509_LOOKUP_get_store (lu);
 	for (i = 0; i < sk_X509_INFO_num(inf); i++) {
 		itmp = sk_X509_INFO_value(inf, i);
 		if (itmp->x509) {
-			X509_STORE_add_cert(lu->store_ctx, itmp->x509);
+			X509_STORE_add_cert(store, itmp->x509);
 			count++;
 		}
 		if (itmp->crl) {
-			X509_STORE_add_crl(lu->store_ctx, itmp->crl);
+			X509_STORE_add_crl(store, itmp->crl);
 			count++;
 		}
 	}

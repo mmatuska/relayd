@@ -180,7 +180,7 @@ DESTINATION PRIORITY ROUTER RTLABEL RTABLE MATCH
 */
 
 %token	ALL APPEND BACKLOG BACKUP BUFFER CA CACHE SET CHECK CIPHERS CODE
-%token	COOKIE DEMOTE DIGEST DISABLE ERROR EXPECT PASS BLOCK EXTERNAL FILENAME
+%token	COOKIE DEMOTE DIGEST DISABLE DONTFRAG ERROR EXPECT PASS BLOCK EXTERNAL FILENAME
 %token	FORWARD FROM HASH HEADER HOST ICMP INCLUDE INET INET6 INTERFACE
 %token	INTERVAL IP LABEL LISTEN VALUE LOADBALANCE LOG LOOKUP METHOD MODE NAT
 %token	NO NODELAY NOTHING ON PARENT PATH PFTAG PORT PREFORK
@@ -977,6 +977,12 @@ tcpflags_l	: tcpflags comma tcpflags_l
 
 tcpflags	: SACK			{ proto->tcpflags |= TCPFLAG_SACK; }
 		| NO SACK		{ proto->tcpflags |= TCPFLAG_NSACK; }
+		| DONTFRAG NUMBER	{ proto->tcpflags |= TCPFLAG_DONTFRAG;
+			                   if ((proto->dontfragsiz = $2) < 0) {
+						yyerror("invalid dontfrag size: %d", $2);
+						YYERROR;
+                                           }
+                                        }
 		| NODELAY		{ proto->tcpflags |= TCPFLAG_NODELAY; }
 		| NO NODELAY		{ proto->tcpflags |= TCPFLAG_NNODELAY; }
 		| SPLICE		{ /* default */ }
@@ -2126,6 +2132,7 @@ lookup(char *s)
 */
 		{ "digest",		DIGEST },
 		{ "disable",		DISABLE },
+		{ "dontfrag",		DONTFRAG },
 		{ "ecdh",		ECDH },
 		{ "edh",		EDH },
 		{ "error",		ERROR },
@@ -2227,9 +2234,9 @@ lookup(char *s)
 
 #define MAXPUSHBACK	128
 
-u_char	*parsebuf;
+char	*parsebuf;
 int	 parseindex;
-u_char	 pushback_buffer[MAXPUSHBACK];
+char	 pushback_buffer[MAXPUSHBACK];
 int	 pushback_index = 0;
 
 int
@@ -2322,8 +2329,9 @@ findeol(void)
 int
 yylex(void)
 {
-	u_char	 buf[8096];
-	u_char	*p, *val;
+	char	 buf[8096];
+	char *p;
+        char *val;
 	int	 quotec, next, c;
 	int	 token;
 

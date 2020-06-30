@@ -654,6 +654,7 @@ TAILQ_HEAD(relay_rules, relay_rule);
 #define TCPFLAG_IPTTL		0x20
 #define TCPFLAG_IPMINTTL	0x40
 #define TCPFLAG_NSPLICE		0x80
+#define TCPFLAG_DONTFRAG	0x100
 #define TCPFLAG_DEFAULT		0x00
 
 #define TCPFLAG_BITS						\
@@ -683,7 +684,7 @@ TAILQ_HEAD(relay_rules, relay_rule);
 struct protocol {
 	objid_t			 id;
 	u_int32_t		 flags;
-	u_int8_t		 tcpflags;
+	u_int16_t		 tcpflags;
 	int			 tcpbufsiz;
 	int			 tcpbacklog;
 	u_int8_t		 tcpipttl;
@@ -710,6 +711,7 @@ struct protocol {
 
 	struct relay_rules	 rules;
 	int			 rulecount;
+	int			 dontfragsiz;
 
 	TAILQ_ENTRY(protocol)	 entry;
 };

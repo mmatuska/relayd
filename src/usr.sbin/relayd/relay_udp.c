@@ -164,6 +164,12 @@ relay_udp_socket(struct sockaddr_storage *ss, in_port_t port,
 		    &val, sizeof(val)) == -1)
 			goto bad;
 	}
+	if (proto->tcpflags & TCPFLAG_DONTFRAG) {
+		val = (int)proto->dontfragsiz;
+		if (setsockopt(s, IPPROTO_IP, IP_DONTFRAG,
+		    &val, sizeof(val)) == -1)
+			goto bad;
+        }
 
 	return (s);
 
