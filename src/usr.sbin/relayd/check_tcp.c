@@ -31,7 +31,6 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <fnmatch.h>
-#include <sha.h>
 
 #include <openssl/ssl.h>
 

@@ -45,15 +45,16 @@
 #include <unistd.h>
 #include <ctype.h>
 #include <pwd.h>
-#ifdef __FreeBSD__
-#include <sha.h>
-#else
-#include <sha1.h>
-#endif
 #include <md5.h>
 
 #include <openssl/ssl.h>
 
+#ifdef __FreeBSD__
+ /* #include <sha.h>  */
+ char   *SHA1_Data(const void *, unsigned int, char *);
+#else
+#include <sha1.h>
+#endif
 #include "relayd.h"
 
 __dead void	 usage(void);
@@ -242,7 +243,6 @@ main(int argc, char *argv[])
 
 #ifdef __FreeBSD__
 #if __FreeBSD_version > 800040
-	arc4random_stir();
 	arc4random_buf(rnd, sizeof(rnd));
 	RAND_seed(rnd, sizeof(rnd));
 #else
@@ -250,6 +250,10 @@ main(int argc, char *argv[])
 #endif
 #endif
 
+	if (load_config(env->sc_conffile, env) == -1) {
+		proc_kill(env->sc_ps);
+		exit(1);
+	}
 	ps->ps_instances[PROC_RELAY] = env->sc_prefork_relay;
 	ps->ps_instances[PROC_CA] = env->sc_prefork_relay;
 	ps->ps_ninstances = env->sc_prefork_relay;
@@ -273,11 +277,6 @@ main(int argc, char *argv[])
 	signal_add(&ps->ps_evsigpipe, NULL);
 
 	proc_listen(ps, procs, nitems(procs));
-
-	if (load_config(env->sc_conffile, env) == -1) {
-		proc_kill(env->sc_ps);
-		exit(1);
-	}
 
 	if (env->sc_opts & RELAYD_OPT_NOACTION) {
 		fprintf(stderr, "configuration OK\n");
