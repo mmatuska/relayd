@@ -55,6 +55,8 @@
 
 #include <openssl/ssl.h>
 
+#define IN_MAIN
+
 #include "relayd.h"
 #include "http.h"
 // FreeBSD #include "snmp.h"
